@@ -1,0 +1,22 @@
+#import <AppKit/AppKit.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+// Live preview of yomado's virtual displays for the person sharing the Mac.
+//
+// A thin edge strip on the right of a physical screen shows one tab per
+// running virtual display. Hovering expands it into live thumbnail cards;
+// clicking a card opens a picture-in-picture panel that follows that display
+// at full frame rate. Everything is view-only and non-activating: panels
+// never take focus from the user's current app and never send input.
+//
+// Capture uses ScreenCaptureKit and needs the Screen Recording permission.
+@interface YMWorkspacePreview : NSObject
+@property(nonatomic, readonly) BOOL enabled;
+- (void)setEnabled:(BOOL)enabled;
+// displays: @[@{@"displayID": @(CGDirectDisplayID), @"name": NSString}], in display order.
+- (void)updateDisplays:(NSArray<NSDictionary *> *)displays;
+- (void)invalidate;
+@end
+
+NS_ASSUME_NONNULL_END

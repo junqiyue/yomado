@@ -21,6 +21,7 @@
 #import "DisplayProfileEditor.h"
 #import "SavedDisplayProfilesView.h"
 #import "InputLease.h"
+#import "WorkspacePreview.h"
 
 static NSString *YMAppVersion(void) {
     return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"—";
@@ -176,6 +177,8 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property NSButton *addDisplayButton;
 @property YMAppWorkspace *appWorkspace;
 @property YMInputLeaseCenter *inputLeases;
+@property YMWorkspacePreview *workspacePreview;
+@property BOOL displayCommandHeadless; // a --display request is running: report failures in its reply, never in a dialog
 @property NSStackView *applicationCards;
 @property NSView *permissionContainer;
 @property NSMutableDictionary<NSNumber *, YMAppWorkspaceView *> *workspaceViews;
@@ -397,6 +400,7 @@ static os_log_t YMQuitLog(void) {
     }
 }
 - (BOOL)confirmLeavingUnmovableWindows:(NSString *)summary {
+    if (self.displayCommandHeadless) return NO; // never ask the person on an agent's behalf; keep the screen
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"有窗口无法挪回原位";
     alert.informativeText = [NSString stringWithFormat:@"%@多半是弹窗、启动画面或工具窗，yomado 无法可靠地把它们挪回原位。其他窗口照常返回原位。\n继续关闭后，macOS 会把这些窗口移到剩下的屏幕上，位置可能不同。", summary];
@@ -479,6 +483,7 @@ static os_log_t YMQuitLog(void) {
     self.inputLeases = [[YMInputLeaseCenter alloc] init];
     [self.inputLeases start];
     [self startDisplayCommands];
+    self.workspacePreview = [[YMWorkspacePreview alloc] init];
     EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
     OSStatus handlerStatus = InstallEventHandler(GetApplicationEventTarget(), RecoveryHotkey, 1, &type,
                                                 (__bridge void *)self, &_keyHandler);
@@ -608,6 +613,9 @@ static os_log_t YMQuitLog(void) {
     }
     if (!active.count) [menu addItem:[[NSMenuItem alloc] initWithTitle:@"尚无运行中的虚拟屏" action:nil keyEquivalent:@""]];
     [menu addItem:[self menuItem:@"添加或启动虚拟屏…" action:@selector(showWindow:) profile:nil]];
+    NSMenuItem *preview = [self menuItem:@"在屏幕边缘预览虚拟屏" action:@selector(toggleWorkspacePreview:) profile:nil];
+    preview.state = self.workspacePreview.enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:preview];
     if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay)
         [menu addItem:[self menuItem:@"微信返回原显示器" action:@selector(wechatRestore:) profile:nil]];
     if (self.topologyRecoverySnapshot)
@@ -627,6 +635,11 @@ static os_log_t YMQuitLog(void) {
     }
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItem:[self menuItem:@"完全退出 yomado" action:@selector(quit:) profile:nil]];
+}
+- (void)toggleWorkspacePreview:(id)sender {
+    (void)sender;
+    [self.workspacePreview setEnabled:!self.workspacePreview.enabled];
+    [self updateInventory];
 }
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if (item.action == @selector(checkForUpdates:))
@@ -1375,7 +1388,7 @@ static os_log_t YMQuitLog(void) {
 - (void)reportApplicationError:(NSError *)error fallback:(NSString *)fallback {
     self.detailLabel.stringValue = error.localizedDescription ?: fallback;
     self.statusLabel.stringValue = @"应用窗口操作未完成";
-    if (!self.previewMode && !self.window.attachedSheet) {
+    if (!self.previewMode && !self.displayCommandHeadless && !self.window.attachedSheet) {
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"未能移动窗口";
         alert.informativeText = self.detailLabel.stringValue;
@@ -1615,6 +1628,11 @@ static os_log_t YMQuitLog(void) {
             NSMutableArray *ids = [NSMutableArray array];
             for (YMManagedDisplay *profile in [self activeProfiles]) [ids addObject:@(profile.display.displayID)];
             [self.appWorkspace refreshWithVirtualDisplayIDs:ids displaySnapshot:snapshot];
+            NSMutableArray *previewDisplays = [NSMutableArray array];
+            for (YMManagedDisplay *profile in [self activeProfiles])
+                if (profile.topologyVerified)
+                    [previewDisplays addObject:@{@"displayID":@(profile.display.displayID), @"name":[self titleForProfile:profile]}];
+            [self.workspacePreview updateDisplays:previewDisplays];
             [self updateWeChatControls];
         }
         [self updateApplicationCardsWithSnapshot:snapshot];
@@ -2338,6 +2356,7 @@ static os_log_t YMQuitLog(void) {
     (void)notification;
     [self.panelPresenter invalidate];
     [self.inputLeases stop];
+    [self.workspacePreview invalidate];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.heartbeatTimer invalidate];
     if (self.hotkey) UnregisterEventHotKey(self.hotkey);
@@ -2710,11 +2729,35 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
             return;
         }
         [self selectProfile:profile];
-        if (self.selectedProfile == profile) [self stop:nil];
-        [self displayCommandAwait:profile requestID:requestID running:NO deadline:[NSDate dateWithTimeIntervalSinceNow:YMDisplayCommandSeconds - 5]];
+        if (self.selectedProfile != profile) {
+            [self displayCommandRespond:requestID status:@"busy" extra:@{@"message":@"Could not select the display."}];
+            return;
+        }
+        [self displayCommandClose:profile requestID:requestID deadline:[NSDate dateWithTimeIntervalSinceNow:YMDisplayCommandSeconds - 5]];
         return;
     }
     [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Unknown action. Use list, start or close."}];
+}
+// Window lists settle a moment after an agent closes its windows; wait for a
+// verified inventory instead of letting the close refuse and raise a dialog.
+- (void)displayCommandClose:(YMManagedDisplay *)profile requestID:(NSString *)requestID deadline:(NSDate *)deadline {
+    [self.appWorkspace refreshInventory];
+    BOOL ready = [self.appWorkspace inventoryReadyForClosingDisplayID:profile.display.displayID];
+    if (!ready && deadline.timeIntervalSinceNow > 10) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self displayCommandClose:profile requestID:requestID deadline:deadline];
+        });
+        return;
+    }
+    self.displayCommandHeadless = YES;
+    @try { [self stop:nil]; } @finally { self.displayCommandHeadless = NO; }
+    if (profile.display.isCreated && !self.displayOperationInProgress) {
+        [self displayCommandRespond:requestID status:@"failed"
+            extra:@{@"message":self.detailLabel.stringValue.length ? self.detailLabel.stringValue : @"Display was kept; windows could not be verified.",
+                    @"inventoryReady":@(ready)}];
+        return;
+    }
+    [self displayCommandAwait:profile requestID:requestID running:NO deadline:deadline];
 }
 - (void)displayCommandAwait:(YMManagedDisplay *)profile requestID:(NSString *)requestID running:(BOOL)wantRunning deadline:(NSDate *)deadline {
     BOOL running = profile.display.isCreated && profile.topologyVerified;
