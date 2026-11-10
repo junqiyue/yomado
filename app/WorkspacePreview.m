@@ -823,7 +823,8 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 // enters a virtual display, put it back at the nearest physical point.
 - (void)updateCursorFence {
     id setting = [NSUserDefaults.standardUserDefaults objectForKey:@"YMCursorFenceEnabled"];
-    BOOL want = self.displays.count > 0 && (setting == nil || [setting boolValue]);   // on unless turned off
+    // On while the preview is on (the agent-screen setup), unless set explicitly.
+    BOOL want = self.displays.count > 0 && (setting ? [setting boolValue] : self.enabled);
     if (want && !self.fenceGlobalMonitor) {
         __weak YMWorkspacePreview *weakSelf = self;
         NSEventMask mask = NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged;
@@ -956,9 +957,7 @@ static CGRect YMElementFrame(AXUIElementRef element) {
 // Web content often answers a hit test with a stack of generic groups in front
 // of the real control, so search the window's tree for the smallest control
 // whose frame contains the point.
-static NSMutableArray *YMTapTrace;
 static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray *controls, BOOL prune) {
-    YMTapTrace = [NSMutableArray array];
     NSMutableArray *found = [NSMutableArray array];
     NSMutableArray *queue = [NSMutableArray arrayWithObject:(__bridge id)window];
     NSUInteger visited = 0;
@@ -968,7 +967,6 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
         CGRect frame = YMElementFrame(element);
         BOOL sized = frame.size.width > 0 && frame.size.height > 0;
         NSString *role = YMElementRole(element);
-        if (YMTapTrace.count < 80) [YMTapTrace addObject:[NSString stringWithFormat:@"%@ %@ %@", role, NSStringFromRect(NSRectFromCGRect(frame)), sized && !CGRectContainsPoint(frame, point) ? @"x" : @""]];
         // Web groups can report frames that do not cover their children, so the
         // second pass walks everything (bounded) instead of pruning.
         if (prune && sized && !CGRectContainsPoint(frame, point)) continue;
@@ -980,7 +978,6 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
             CFRelease(children);
         }
     }
-    if (found.count == 0) [found addObject:@{@"element":(__bridge id)window, @"area":@(INFINITY), @"role":@"__visited", @"visited":@(visited)}];
     [found sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"area"] compare:b[@"area"]]; }];
     return found;
 }
@@ -1044,11 +1041,8 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
     CFStringRef action = secondary ? kAXShowMenuAction : kAXPressAction;
     AXUIElementRef window = YMCopyWindowAtPoint(target);
     NSArray *candidates = window ? YMControlsAtPoint(window, target, controls, YES) : @[];
-    if (window && candidates.firstObject[@"visited"]) candidates = YMControlsAtPoint(window, target, controls, NO);
-    CGRect windowFrame = window ? YMElementFrame(window) : CGRectZero;
+    if (window && !candidates.count) candidates = YMControlsAtPoint(window, target, controls, NO);
     if (window) CFRelease(window);
-    NSNumber *visitedCount = candidates.firstObject[@"visited"];
-    if (visitedCount) candidates = @[];
     for (NSDictionary *candidate in candidates) {
         AXUIElementRef element = (__bridge AXUIElementRef)candidate[@"element"];
         if (!secondary && YMElementIsText(element)) {
@@ -1071,19 +1065,7 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
     }
     CFRelease(hit);
     [self markPoint:target];
-    NSMutableArray *roles = [NSMutableArray array];
-    for (id item in chain) {
-        CFTypeRef title = NULL;
-        AXUIElementCopyAttributeValue((__bridge AXUIElementRef)item, kAXDescriptionAttribute, &title);
-        NSString *label = title ? CFBridgingRelease(title) : @"";
-        [roles addObject:[NSString stringWithFormat:@"%@%@", YMElementRole((__bridge AXUIElementRef)item), label.length ? [@":" stringByAppendingString:label] : @""]];
-    }
-    NSMutableDictionary *reply = [(result ?: @{@"status":@"nothing-to-press", @"role":role}) mutableCopy];
-    reply[@"chain"] = roles;
-    reply[@"candidates"] = @(candidates.count);
-    if (visitedCount) { reply[@"visited"] = visitedCount; reply[@"trace"] = YMTapTrace ?: @[]; }
-    reply[@"window"] = window ? NSStringFromRect(NSRectFromCGRect(windowFrame)) : @"none";
-    return reply;
+    return result ?: @{@"status":@"nothing-to-press", @"role":role};
 }
 // Web inputs ignore inserted selected text but accept a whole new value, so
 // edit the value string: append on typing, drop the last character on delete.
