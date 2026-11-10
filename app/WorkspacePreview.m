@@ -297,6 +297,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 @property(nonatomic, copy, nullable) void (^onInsert)(NSString *text);
 @property(nonatomic, copy, nullable) void (^onCommand)(NSString *command);
 @property(nonatomic, copy, nullable) void (^onMarked)(NSString *text);
+@property(nonatomic, copy, nullable) NSRect (^caretRect)(void);   // in view coordinates; NSZeroRect when unknown
 @property(nonatomic) NSView *bar;
 @property(nonatomic) NSTextField *title;
 @property(nonatomic) NSButton *closeButton;
@@ -518,8 +519,10 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 - (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual {
     (void)range; (void)actual;
-    // Candidate window sits under the status pill.
-    NSRect local = NSMakeRect(NSMidX(self.pill.frame) - 40, NSMinY(self.pill.frame) - 4, 80, 20);
+    // Put the candidate window under the field being typed into, as it would
+    // be on the virtual display; fall back to under the status pill.
+    NSRect local = self.caretRect ? self.caretRect() : NSZeroRect;
+    if (NSIsEmptyRect(local)) local = NSMakeRect(NSMidX(self.pill.frame) - 40, NSMinY(self.pill.frame) - 4, 80, 20);
     return [self.window convertRectToScreen:[self convertRect:local toView:nil]];
 }
 - (NSUInteger)characterIndexForPoint:(NSPoint)point { (void)point; return NSNotFound; }
@@ -1120,6 +1123,34 @@ static NSString *YMElementValue(AXUIElementRef element) {
         if (target && YMElementHasAction(target, kAXConfirmAction)) AXUIElementPerformAction(target, kAXConfirmAction);
     }
 }
+// The typing position (caret, else the field) mapped from the virtual display
+// into the picture-in-picture view.
+- (NSRect)caretRectInPiP {
+    AXUIElementRef field = (__bridge AXUIElementRef)self.takeoverTextElement;
+    if (!field || !self.takeoverDisplayID) return NSZeroRect;
+    CGRect global = CGRectNull;
+    CFTypeRef rangeValue = NULL;
+    if (AXUIElementCopyAttributeValue(field, kAXSelectedTextRangeAttribute, &rangeValue) == kAXErrorSuccess && rangeValue) {
+        CFTypeRef boundsValue = NULL;
+        if (AXUIElementCopyParameterizedAttributeValue(field, kAXBoundsForRangeParameterizedAttribute, rangeValue, &boundsValue) == kAXErrorSuccess && boundsValue) {
+            CGRect caret = CGRectZero;
+            if (AXValueGetValue((AXValueRef)boundsValue, kAXValueTypeCGRect, &caret) && caret.size.height > 0) global = caret;
+            CFRelease(boundsValue);
+        }
+        CFRelease(rangeValue);
+    }
+    if (CGRectIsNull(global)) {
+        CGRect frame = YMElementFrame(field);
+        if (frame.size.height <= 0) return NSZeroRect;
+        global = CGRectMake(frame.origin.x + 4, frame.origin.y, 2, frame.size.height);
+    }
+    CGRect bounds = CGDisplayBounds(self.takeoverDisplayID.unsignedIntValue);
+    CGRect fit = YMAspectFitRect(bounds.size, self.pipView.picture.bounds);
+    CGFloat sx = fit.size.width / bounds.size.width, sy = fit.size.height / bounds.size.height;
+    CGFloat x = fit.origin.x + (global.origin.x - bounds.origin.x) * sx;
+    CGFloat bottom = fit.origin.y + (1 - (CGRectGetMaxY(global) - bounds.origin.y) / bounds.size.height) * fit.size.height;
+    return NSMakeRect(x, bottom, MAX(2, global.size.width * sx), MAX(8, global.size.height * sy));
+}
 - (void)showComposition:(NSString *)text {
     self.pipView.pillLabel.stringValue = text.length
         ? [NSString stringWithFormat:@"输入中：%@", text]
@@ -1209,6 +1240,7 @@ static NSString *YMElementValue(AXUIElementRef element) {
         view.onInsert = ^(NSString *text) { [weakSelf typeText:text]; };
         view.onCommand = ^(NSString *command) { [weakSelf handleTakeoverCommand:command]; };
         view.onMarked = ^(NSString *text) { [weakSelf showComposition:text]; };
+        view.caretRect = ^NSRect { return [weakSelf caretRectInPiP]; };
         view.onLeftTooLong = ^{ [weakSelf endTakeover]; };
         panel.contentView = view;
         self.pip = panel;
