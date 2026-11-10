@@ -173,9 +173,11 @@ static void YMAddRipple(CALayer *host, CGPoint at, CGFloat radius) {
 #pragma mark - Panels and views
 
 @interface YMPreviewPanel : NSPanel
+@property(nonatomic) BOOL takeoverKey;
 @end
 @implementation YMPreviewPanel
-- (BOOL)canBecomeKeyWindow { return NO; }
+// Key only while the person is typing into a taken-over display.
+- (BOOL)canBecomeKeyWindow { return self.takeoverKey; }
 - (BOOL)canBecomeMainWindow { return NO; }
 @end
 
@@ -286,15 +288,25 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 - (void)mouseExited:(NSEvent *)event { (void)event; if (self.onHover) self.onHover(NO); }
 @end
 
-// Picture-in-picture content: live picture, controls fade in on hover.
+// Picture-in-picture content: live picture; a glass toolbar fades in on hover.
+// While the person has taken over, the toolbar and a status pill stay visible
+// and an accent ring marks the panel.
 @interface YMPiPView : YMPreviewHitView
 @property(nonatomic) CALayer *picture;
 @property(nonatomic) NSView *bar;
 @property(nonatomic) NSTextField *title;
 @property(nonatomic) NSButton *closeButton;
+@property(nonatomic) NSVisualEffectView *toolbar;
 @property(nonatomic) NSButton *takeoverButton;
+@property(nonatomic) NSVisualEffectView *pill;
+@property(nonatomic) NSTextField *pillLabel;
 @property(nonatomic) BOOL takeover;
-@property(nonatomic, copy, nullable) void (^onForward)(NSEvent *event, NSPoint point);
+@property(nonatomic) BOOL takeoverAvailable;
+@property(nonatomic) NSTimer *leaveTimer;
+@property(nonatomic, copy, nullable) void (^onTap)(NSPoint point, BOOL secondary, NSInteger clicks);
+@property(nonatomic, copy, nullable) void (^onScroll)(NSPoint point, NSEvent *event);
+@property(nonatomic, copy, nullable) void (^onKey)(NSEvent *event);
+@property(nonatomic, copy, nullable) void (^onLeftTooLong)(void);
 @end
 @implementation YMPiPView
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -321,55 +333,86 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         _closeButton.contentTintColor = [NSColor colorWithWhite:1 alpha:0.9];
         _closeButton.toolTip = @"收起预览";
         [_bar addSubview:_closeButton];
-        _takeoverButton = [NSButton buttonWithTitle:@"接管" target:nil action:nil];
-        _takeoverButton.bezelStyle = NSBezelStyleInline;
-        _takeoverButton.controlSize = NSControlSizeSmall;
-        _takeoverButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
-        _takeoverButton.toolTip = @"在这个画面里直接操作虚拟屏;Agent 会暂停";
-        [_bar addSubview:_takeoverButton];
+
+        _toolbar = [[NSVisualEffectView alloc] init];
+        _toolbar.material = NSVisualEffectMaterialHUDWindow;
+        _toolbar.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+        _toolbar.state = NSVisualEffectStateActive;
+        _toolbar.wantsLayer = YES;
+        _toolbar.layer.cornerRadius = 22;
+        _toolbar.layer.cornerCurve = kCACornerCurveContinuous;
+        _toolbar.layer.masksToBounds = YES;
+        _toolbar.alphaValue = 0;
+        [self addSubview:_toolbar];
+        _takeoverButton = [NSButton buttonWithTitle:@"接管" image:[NSImage imageWithSystemSymbolName:@"hand.point.up.left.fill" accessibilityDescription:nil] target:nil action:nil];
+        _takeoverButton.bezelStyle = NSBezelStylePush;
+        _takeoverButton.controlSize = NSControlSizeLarge;
+        _takeoverButton.font = [NSFont systemFontOfSize:14 weight:NSFontWeightSemibold];
+        _takeoverButton.imagePosition = NSImageLeading;
+        _takeoverButton.imageHugsTitle = YES;
+        [_toolbar addSubview:_takeoverButton];
+
+        _pill = [[NSVisualEffectView alloc] init];
+        _pill.material = NSVisualEffectMaterialHUDWindow;
+        _pill.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+        _pill.state = NSVisualEffectStateActive;
+        _pill.wantsLayer = YES;
+        _pill.layer.cornerRadius = 14;
+        _pill.layer.cornerCurve = kCACornerCurveContinuous;
+        _pill.layer.masksToBounds = YES;
+        _pill.hidden = YES;
+        [self addSubview:_pill];
+        _pillLabel = [NSTextField labelWithString:@"你正在操作 · Agent 已暂停 · 按 Esc 交还"];
+        _pillLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+        _pillLabel.textColor = NSColor.whiteColor;
+        _pillLabel.alignment = NSTextAlignmentCenter;
+        [_pill addSubview:_pillLabel];
+        [self applyTakeoverAppearance];
     }
     return self;
 }
+- (BOOL)acceptsFirstResponder { return self.takeover; }
+- (void)applyTakeoverAppearance {
+    BOOL on = self.takeover;
+    self.layer.borderWidth = on ? 3 : 0;
+    self.layer.borderColor = NSColor.controlAccentColor.CGColor;
+    self.layer.shadowColor = NSColor.controlAccentColor.CGColor;
+    self.takeoverButton.title = on ? @"交还给 Agent" : @"接管";
+    self.takeoverButton.image = [NSImage imageWithSystemSymbolName:on ? @"arrow.uturn.backward.circle.fill" : @"hand.point.up.left.fill" accessibilityDescription:nil];
+    self.takeoverButton.bezelColor = on ? NSColor.controlAccentColor : nil;
+    self.takeoverButton.toolTip = on ? @"交还给 Agent(Esc)" : @"在这个画面里直接点、输入;Agent 会暂停";
+    self.takeoverButton.hidden = !self.takeoverAvailable;
+    self.toolbar.hidden = !self.takeoverAvailable;
+    self.pill.hidden = !on;
+    if (on) { self.toolbar.alphaValue = 1; self.bar.alphaValue = 1; }
+    self.needsLayout = YES;
+}
 - (void)setTakeover:(BOOL)takeover {
     _takeover = takeover;
-    self.layer.borderWidth = takeover ? 3 : 0;
-    self.layer.borderColor = NSColor.controlAccentColor.CGColor;
-    self.takeoverButton.title = takeover ? @"交还" : @"接管";
-    self.takeoverButton.toolTip = takeover ? @"交还给 Agent" : @"在这个画面里直接操作虚拟屏;Agent 会暂停";
-    self.bar.alphaValue = takeover ? 1 : self.bar.alphaValue;
-    [self needsLayout];
+    [self.leaveTimer invalidate];
+    self.leaveTimer = nil;
+    [self applyTakeoverAppearance];
+    if (takeover) [self.window makeFirstResponder:self];
 }
+- (void)setTakeoverAvailable:(BOOL)available { _takeoverAvailable = available; [self applyTakeoverAppearance]; }
 - (BOOL)mouseDownCanMoveWindow { return !self.takeover; }
-- (BOOL)forwardIfTakingOver:(NSEvent *)event {
-    if (!self.takeover || !self.onForward) return NO;
-    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-    NSView *hit = [self hitTest:[self.superview convertPoint:event.locationInWindow fromView:nil]];
-    if ([hit isKindOfClass:NSButton.class]) return NO;
-    self.onForward(event, point);
-    return YES;
-}
-// Presses are swallowed and replayed as one complete click on release. Replaying
-// a press while the physical button is still down hands that press to the
-// target app and leaves the system in a stuck drag (seen 2026-11-10).
-- (BOOL)swallowIfTakingOver:(NSEvent *)event {
-    if (!self.takeover) return NO;
-    NSView *hit = [self hitTest:[self.superview convertPoint:event.locationInWindow fromView:nil]];
-    return ![hit isKindOfClass:NSButton.class];
-}
-- (void)mouseDown:(NSEvent *)event { if (![self swallowIfTakingOver:event]) [super mouseDown:event]; }
-- (void)mouseDragged:(NSEvent *)event { if (![self swallowIfTakingOver:event]) [super mouseDragged:event]; }
-- (void)mouseUp:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseUp:event]; }
-- (void)rightMouseDown:(NSEvent *)event { if (![self swallowIfTakingOver:event]) [super rightMouseDown:event]; }
-- (void)rightMouseUp:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super rightMouseUp:event]; }
-- (void)scrollWheel:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super scrollWheel:event]; }
 - (void)layout {
     [super layout];
+    NSSize size = self.bounds.size;
     self.picture.frame = self.layer.bounds;
     CGFloat height = 40;
-    self.bar.frame = NSMakeRect(0, self.bounds.size.height - height, self.bounds.size.width, height);
-    self.title.frame = NSMakeRect(14, 12, self.bounds.size.width - 130, 16);
-    self.closeButton.frame = NSMakeRect(self.bounds.size.width - 34, 10, 20, 20);
-    self.takeoverButton.frame = NSMakeRect(self.bounds.size.width - 92, 9, 52, 22);
+    self.bar.frame = NSMakeRect(0, size.height - height, size.width, height);
+    self.title.frame = NSMakeRect(14, 12, size.width - 60, 16);
+    self.closeButton.frame = NSMakeRect(size.width - 34, 10, 20, 20);
+    [self.takeoverButton sizeToFit];
+    NSSize button = self.takeoverButton.frame.size;
+    CGFloat toolbarWidth = button.width + 16, toolbarHeight = 44;
+    self.toolbar.frame = NSMakeRect((size.width - toolbarWidth) / 2, 14, toolbarWidth, toolbarHeight);
+    self.takeoverButton.frame = NSMakeRect(8, (toolbarHeight - button.height) / 2, button.width, button.height);
+    [self.pillLabel sizeToFit];
+    CGFloat pillWidth = self.pillLabel.frame.size.width + 28;
+    self.pill.frame = NSMakeRect((size.width - pillWidth) / 2, size.height - 52, pillWidth, 28);
+    self.pillLabel.frame = NSMakeRect(14, (28 - self.pillLabel.frame.size.height) / 2, self.pillLabel.frame.size.width, self.pillLabel.frame.size.height);
 }
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
@@ -377,8 +420,54 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
     [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
         options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil]];
 }
-- (void)mouseEntered:(NSEvent *)event { (void)event; YMAnimate(0.18, ^{ self.bar.animator.alphaValue = 1; }, nil); }
-- (void)mouseExited:(NSEvent *)event { (void)event; if (!self.takeover) YMAnimate(0.25, ^{ self.bar.animator.alphaValue = 0; }, nil); }
+- (void)mouseEntered:(NSEvent *)event {
+    (void)event;
+    [self.leaveTimer invalidate];
+    self.leaveTimer = nil;
+    YMAnimate(0.18, ^{ self.bar.animator.alphaValue = 1; self.toolbar.animator.alphaValue = 1; }, nil);
+}
+- (void)mouseExited:(NSEvent *)event {
+    (void)event;
+    if (self.takeover) {
+        // Leaving the panel for a while hands control back, so it can never be stranded.
+        __weak YMPiPView *weakSelf = self;
+        self.leaveTimer = [NSTimer scheduledTimerWithTimeInterval:3 repeats:NO block:^(NSTimer *timer) {
+            (void)timer;
+            if (weakSelf.onLeftTooLong) weakSelf.onLeftTooLong();
+        }];
+        return;
+    }
+    YMAnimate(0.25, ^{ self.bar.animator.alphaValue = 0; self.toolbar.animator.alphaValue = 0; }, nil);
+}
+- (BOOL)eventHitsControl:(NSEvent *)event {
+    NSView *hit = [self hitTest:[self.superview convertPoint:event.locationInWindow fromView:nil]];
+    for (NSView *view = hit; view; view = view.superview)
+        if ([view isKindOfClass:NSControl.class] || view == self.toolbar) return YES;
+    return NO;
+}
+// While taking over, presses are swallowed and each release becomes one
+// tap; nothing here ever moves the real pointer or posts global input.
+- (void)mouseDown:(NSEvent *)event { if (!self.takeover || [self eventHitsControl:event]) [super mouseDown:event]; }
+- (void)mouseDragged:(NSEvent *)event { if (!self.takeover) [super mouseDragged:event]; }
+- (void)mouseUp:(NSEvent *)event {
+    if (self.takeover && ![self eventHitsControl:event]) {
+        if (self.onTap) self.onTap([self convertPoint:event.locationInWindow fromView:nil], NO, event.clickCount);
+        return;
+    }
+    [super mouseUp:event];
+}
+- (void)rightMouseUp:(NSEvent *)event {
+    if (self.takeover && self.onTap) { self.onTap([self convertPoint:event.locationInWindow fromView:nil], YES, 1); return; }
+    [super rightMouseUp:event];
+}
+- (void)scrollWheel:(NSEvent *)event {
+    if (self.takeover && self.onScroll) { self.onScroll([self convertPoint:event.locationInWindow fromView:nil], event); return; }
+    [super scrollWheel:event];
+}
+- (void)keyDown:(NSEvent *)event {
+    if (self.takeover && self.onKey) { self.onKey(event); return; }
+    [super keyDown:event];
+}
 @end
 
 #pragma mark - Controller
@@ -399,8 +488,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 @property(nonatomic, nullable) NSNumber *pipDisplayID;
 @property(nonatomic) BOOL permissionMissing;
 @property(nonatomic, readwrite, nullable) NSNumber *takeoverDisplayID;
-@property(nonatomic, nullable) NSRunningApplication *takeoverPreviousApp;
-@property(nonatomic, nullable) id takeoverPreviousWindow;
+@property(nonatomic, nullable) id takeoverTextElement;
 @end
 
 @implementation YMWorkspacePreview
@@ -665,89 +753,262 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 
 #pragma mark Takeover
 
-// The person drives the virtual display from the picture-in-picture panel.
-// Each mouse event is replayed at the matching point on the virtual display
-// and the pointer is put straight back over the panel, so the person keeps
-// their place. Clicking there activates the target app, so the physical
-// keyboard types into it directly. Handing back restores the app and window
-// that had focus before.
+// The person drives the virtual display from the picture-in-picture panel
+// without lending their pointer: a tap is resolved to the accessibility
+// element at that spot and pressed (or focused, for text); typing edits the
+// focused text element; scrolling is delivered to the owning process only.
+// The real pointer, the front app and the person's key window are never used.
+static BOOL YMTakeoverEnabled(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"YMWorkspacePreviewTakeoverEnabled"]; }
+static BOOL YMElementHasAction(AXUIElementRef element, CFStringRef action) {
+    CFArrayRef names = NULL;
+    if (AXUIElementCopyActionNames(element, &names) != kAXErrorSuccess || !names) return NO;
+    BOOL found = CFArrayContainsValue(names, CFRangeMake(0, CFArrayGetCount(names)), action);
+    CFRelease(names);
+    return found;
+}
+static NSString *YMElementRole(AXUIElementRef element) {
+    CFTypeRef role = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &role) != kAXErrorSuccess || !role) return @"";
+    return CFBridgingRelease(role);
+}
+static BOOL YMElementIsText(AXUIElementRef element) {
+    NSString *role = YMElementRole(element);
+    return [@[@"AXTextField", @"AXTextArea", @"AXSearchField", @"AXComboBox"] containsObject:role];
+}
+
+
+#include <dlfcn.h>
+typedef AXError (*YMPreviewWindowIDFunction)(AXUIElementRef, CGWindowID *);
+// The top ordinary window at a global point, as an accessibility element.
+static AXUIElementRef YMCopyWindowAtPoint(CGPoint point) {
+    static YMPreviewWindowIDFunction getWindow;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ getWindow = (YMPreviewWindowIDFunction)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
+    if (!getWindow) return NULL;
+    NSArray *list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    for (NSDictionary *info in list) {
+        if ([info[(id)kCGWindowLayer] integerValue] != 0) continue;
+        CGRect bounds = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &bounds) || !CGRectContainsPoint(bounds, point)) continue;
+        pid_t pid = [info[(id)kCGWindowOwnerPID] intValue];
+        CGWindowID windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
+        AXUIElementRef app = AXUIElementCreateApplication(pid);
+        CFArrayRef windows = NULL;
+        AXUIElementRef found = NULL;
+        if (app && AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
+            for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+                AXUIElementRef element = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
+                CGWindowID candidate = 0;
+                if (getWindow(element, &candidate) == kAXErrorSuccess && candidate == windowID) { found = (AXUIElementRef)CFRetain(element); break; }
+            }
+        }
+        if (windows) CFRelease(windows);
+        if (app) CFRelease(app);
+        return found;   // the topmost window wins, found or not
+    }
+    return NULL;
+}
+
+static CGRect YMElementFrame(AXUIElementRef element) {
+    CFTypeRef frameValue = NULL;
+    if (AXUIElementCopyAttributeValue(element, CFSTR("AXFrame"), &frameValue) == kAXErrorSuccess && frameValue) {
+        CGRect frame = CGRectZero;
+        BOOL ok = CFGetTypeID(frameValue) == AXValueGetTypeID() && AXValueGetValue((AXValueRef)frameValue, kAXValueTypeCGRect, &frame);
+        CFRelease(frameValue);
+        if (ok && frame.size.width > 0) return frame;
+    }
+    CFTypeRef positionValue = NULL, sizeValue = NULL;
+    CGPoint position = CGPointZero; CGSize size = CGSizeZero;
+    if (AXUIElementCopyAttributeValue(element, kAXPositionAttribute, &positionValue) == kAXErrorSuccess && positionValue) {
+        AXValueGetValue((AXValueRef)positionValue, kAXValueTypeCGPoint, &position); CFRelease(positionValue);
+    }
+    if (AXUIElementCopyAttributeValue(element, kAXSizeAttribute, &sizeValue) == kAXErrorSuccess && sizeValue) {
+        AXValueGetValue((AXValueRef)sizeValue, kAXValueTypeCGSize, &size); CFRelease(sizeValue);
+    }
+    return CGRectMake(position.x, position.y, size.width, size.height);
+}
+// Web content often answers a hit test with a stack of generic groups in front
+// of the real control, so search the window's tree for the smallest control
+// whose frame contains the point.
+static NSMutableArray *YMTapTrace;
+static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray *controls) {
+    YMTapTrace = [NSMutableArray array];
+    NSMutableArray *found = [NSMutableArray array];
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:(__bridge id)window];
+    NSUInteger visited = 0;
+    while (queue.count && visited < 6000) {
+        id item = queue.firstObject; [queue removeObjectAtIndex:0]; visited++;
+        AXUIElementRef element = (__bridge AXUIElementRef)item;
+        CGRect frame = YMElementFrame(element);
+        BOOL sized = frame.size.width > 0 && frame.size.height > 0;
+        NSString *role = YMElementRole(element);
+        if (YMTapTrace.count < 80) [YMTapTrace addObject:[NSString stringWithFormat:@"%@ %@ %@", role, NSStringFromRect(NSRectFromCGRect(frame)), sized && !CGRectContainsPoint(frame, point) ? @"x" : @""]];
+        if (sized && !CGRectContainsPoint(frame, point)) continue;
+        if (sized && ([controls containsObject:role] || YMElementIsText(element)))
+            [found addObject:@{@"element":item, @"area":@(frame.size.width * frame.size.height), @"role":role}];
+        CFArrayRef children = NULL;
+        if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children) == kAXErrorSuccess && children) {
+            [queue addObjectsFromArray:(__bridge NSArray *)children];
+            CFRelease(children);
+        }
+    }
+    if (found.count == 0) [found addObject:@{@"element":(__bridge id)window, @"area":@(INFINITY), @"role":@"__visited", @"visited":@(visited)}];
+    [found sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"area"] compare:b[@"area"]]; }];
+    return found;
+}
 - (void)toggleTakeover:(id)sender {
     (void)sender;
     if (self.takeoverDisplayID) [self endTakeover]; else [self beginTakeover];
 }
 - (void)beginTakeover {
-    if (![NSUserDefaults.standardUserDefaults boolForKey:@"YMWorkspacePreviewTakeoverEnabled"]) return;
-    if (!self.pipDisplayID || !AXIsProcessTrusted()) return;
-    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
-    self.takeoverPreviousApp = front;
-    self.takeoverPreviousWindow = nil;
-    if (front) {
-        AXUIElementRef app = AXUIElementCreateApplication(front.processIdentifier);
-        CFTypeRef window = NULL;
-        if (app && AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &window) == kAXErrorSuccess && window)
-            self.takeoverPreviousWindow = CFBridgingRelease(window);
-        if (app) CFRelease(app);
-    }
+    if (!YMTakeoverEnabled() || !self.pipDisplayID || !AXIsProcessTrusted()) return;
     self.takeoverDisplayID = self.pipDisplayID;
+    self.takeoverTextElement = nil;
+    self.pip.takeoverKey = YES;
+    [self.pip makeKeyWindow];
     self.pipView.takeover = YES;
-    self.pipView.title.stringValue = [NSString stringWithFormat:@"你在操作 %@ · Agent 已暂停", [self nameForDisplayID:self.pipDisplayID]];
 }
 - (void)endTakeover {
     if (!self.takeoverDisplayID) return;
     self.takeoverDisplayID = nil;
+    self.takeoverTextElement = nil;
     self.pipView.takeover = NO;
-    if (self.pipDisplayID) self.pipView.title.stringValue = [self nameForDisplayID:self.pipDisplayID];
-    NSRunningApplication *previous = self.takeoverPreviousApp;
-    if (previous && !previous.terminated) {
-        AXUIElementRef app = AXUIElementCreateApplication(previous.processIdentifier);
-        if (self.takeoverPreviousWindow) AXUIElementPerformAction((__bridge AXUIElementRef)self.takeoverPreviousWindow, kAXRaiseAction);
-        if (app) { AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue); CFRelease(app); }
-    }
-    self.takeoverPreviousApp = nil;
-    self.takeoverPreviousWindow = nil;
+    self.pip.takeoverKey = NO;
+    [self.pip resignKeyWindow];
 }
-- (void)forwardEvent:(NSEvent *)event atViewPoint:(NSPoint)point {
-    if (!self.takeoverDisplayID) return;
+- (CGPoint)takeoverTargetForViewPoint:(NSPoint)point valid:(BOOL *)valid {
     CGRect bounds = CGDisplayBounds(self.takeoverDisplayID.unsignedIntValue);
     CGRect fit = YMAspectFitRect(bounds.size, self.pipView.picture.bounds);
     CGFloat nx = (point.x - fit.origin.x) / fit.size.width;
     CGFloat ny = 1 - (point.y - fit.origin.y) / fit.size.height;
-    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
-    CGPoint target = CGPointMake(bounds.origin.x + nx * bounds.size.width, bounds.origin.y + ny * bounds.size.height);
-    CGEventRef now = CGEventCreate(NULL);
-    CGPoint back = now ? CGEventGetLocation(now) : CGPointZero;
-    if (now) CFRelease(now);
-    // Never replay while a physical button is still held.
-    if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft)
-        || CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonRight)) return;
-    NSMutableArray *events = [NSMutableArray array];
-    BOOL click = NO;
-    if (event.type == NSEventTypeLeftMouseUp || event.type == NSEventTypeRightMouseUp) {
-        BOOL right = event.type == NSEventTypeRightMouseUp;
-        CGMouseButton button = right ? kCGMouseButtonRight : kCGMouseButtonLeft;
-        CGEventRef down = CGEventCreateMouseEvent(NULL, right ? kCGEventRightMouseDown : kCGEventLeftMouseDown, target, button);
-        CGEventRef up = CGEventCreateMouseEvent(NULL, right ? kCGEventRightMouseUp : kCGEventLeftMouseUp, target, button);
-        for (id pair in @[(__bridge id)down, (__bridge id)up]) {
-            CGEventSetIntegerValueField((__bridge CGEventRef)pair, kCGMouseEventClickState, MAX(1, event.clickCount));
-            [events addObject:pair];
+    *valid = nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1;
+    return CGPointMake(bounds.origin.x + nx * bounds.size.width, bounds.origin.y + ny * bounds.size.height);
+}
+// Shared with --display tap so the same path can be exercised without a mouse.
+- (NSDictionary *)tapAtGlobalPoint:(CGPoint)target secondary:(BOOL)secondary {
+    AXUIElementRef system = AXUIElementCreateSystemWide();
+    AXUIElementRef hit = NULL;
+    AXError error = AXUIElementCopyElementAtPosition(system, (float)target.x, (float)target.y, &hit);
+    CFRelease(system);
+    if (error != kAXErrorSuccess || !hit) return @{@"status":@"miss"};
+    // Only act inside a virtual display; never on the person's screens.
+    BOOL onVirtual = NO;
+    for (NSDictionary *display in self.displays)
+        if (CGRectContainsPoint(CGDisplayBounds([display[@"displayID"] unsignedIntValue]), target)) onVirtual = YES;
+    if (!onVirtual) { CFRelease(hit); return @{@"status":@"outside"}; }
+    NSString *role = YMElementRole(hit);
+    // Collect the chain from the hit element upward, then prefer a real control
+    // (button, link, checkbox, ...) over a generic group that also lists AXPress.
+    NSMutableArray *chain = [NSMutableArray array];
+    AXUIElementRef element = (AXUIElementRef)CFRetain(hit);
+    for (int depth = 0; depth < 10 && element; depth++) {
+        [chain addObject:(__bridge id)element];
+        AXUIElementRef parent = NULL;
+        AXUIElementCopyAttributeValue(element, kAXParentAttribute, (CFTypeRef *)&parent);
+        CFRelease(element);
+        element = parent;
+        if (element && [YMElementRole(element) isEqualToString:@"AXWebArea"]) { CFRelease(element); element = NULL; }
+    }
+    if (element) CFRelease(element);
+    NSArray *controls = @[@"AXButton", @"AXLink", @"AXCheckBox", @"AXRadioButton", @"AXMenuItem", @"AXMenuButton",
+                          @"AXPopUpButton", @"AXTab", @"AXDisclosureTriangle", @"AXCell", @"AXRow"];
+    NSDictionary *result = nil;
+    CFStringRef action = secondary ? kAXShowMenuAction : kAXPressAction;
+    AXUIElementRef window = YMCopyWindowAtPoint(target);
+    NSArray *candidates = window ? YMControlsAtPoint(window, target, controls) : @[];
+    CGRect windowFrame = window ? YMElementFrame(window) : CGRectZero;
+    if (window) CFRelease(window);
+    NSNumber *visitedCount = candidates.firstObject[@"visited"];
+    if (visitedCount) candidates = @[];
+    for (NSDictionary *candidate in candidates) {
+        AXUIElementRef element = (__bridge AXUIElementRef)candidate[@"element"];
+        if (!secondary && YMElementIsText(element)) {
+            AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue);
+            self.takeoverTextElement = candidate[@"element"];
+            result = @{@"status":@"focused", @"role":candidate[@"role"]};
+            break;
         }
-        CFRelease(down); CFRelease(up);
-        click = YES;
-    } else if (event.type == NSEventTypeScrollWheel) {
-        double scale = event.hasPreciseScrollingDeltas ? 1 : 10;
-        CGEventRef wheel = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2,
-            (int32_t)llround(event.scrollingDeltaY * scale), (int32_t)llround(event.scrollingDeltaX * scale), 0);
-        if (wheel) { [events addObject:(__bridge id)wheel]; CFRelease(wheel); }
+        if (YMElementHasAction(element, action) && AXUIElementPerformAction(element, action) == kAXErrorSuccess) {
+            result = @{@"status":@"pressed", @"role":candidate[@"role"]};
+            break;
+        }
     }
-    if (!events.count) return;
-    CGWarpMouseCursorPosition(target);
-    for (id replay in events) {
-        CGEventSetLocation((__bridge CGEventRef)replay, target);
-        CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)replay);
+    // Fall back to the hit-test chain (generic elements that still accept a press).
+    for (id item in chain) {
+        if (result) break;
+        AXUIElementRef candidate = (__bridge AXUIElementRef)item;
+        if (YMElementHasAction(candidate, action) && AXUIElementPerformAction(candidate, action) == kAXErrorSuccess)
+            result = @{@"status":@"pressed", @"role":YMElementRole(candidate), @"fallback":@YES};
     }
-    CGWarpMouseCursorPosition(back);
-    CGAssociateMouseAndMouseCursorPosition(true);
-    if (click) [self markPoint:target];
+    CFRelease(hit);
+    [self markPoint:target];
+    NSMutableArray *roles = [NSMutableArray array];
+    for (id item in chain) {
+        CFTypeRef title = NULL;
+        AXUIElementCopyAttributeValue((__bridge AXUIElementRef)item, kAXDescriptionAttribute, &title);
+        NSString *label = title ? CFBridgingRelease(title) : @"";
+        [roles addObject:[NSString stringWithFormat:@"%@%@", YMElementRole((__bridge AXUIElementRef)item), label.length ? [@":" stringByAppendingString:label] : @""]];
+    }
+    NSMutableDictionary *reply = [(result ?: @{@"status":@"nothing-to-press", @"role":role}) mutableCopy];
+    reply[@"chain"] = roles;
+    reply[@"candidates"] = @(candidates.count);
+    if (visitedCount) { reply[@"visited"] = visitedCount; reply[@"trace"] = YMTapTrace ?: @[]; }
+    reply[@"window"] = window ? NSStringFromRect(NSRectFromCGRect(windowFrame)) : @"none";
+    return reply;
+}
+- (NSDictionary *)typeText:(NSString *)text {
+    id target = self.takeoverTextElement;
+    if (!target) return @{@"status":@"no-text-focus"};
+    AXError error = AXUIElementSetAttributeValue((__bridge AXUIElementRef)target, kAXSelectedTextAttribute, (__bridge CFStringRef)text);
+    return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed"};
+}
+- (void)deleteBackward {
+    AXUIElementRef target = (__bridge AXUIElementRef)self.takeoverTextElement;
+    if (!target) return;
+    AXValueRef rangeValue = NULL;
+    CFRange range = CFRangeMake(0, 0);
+    if (AXUIElementCopyAttributeValue(target, kAXSelectedTextRangeAttribute, (CFTypeRef *)&rangeValue) == kAXErrorSuccess && rangeValue) {
+        AXValueGetValue(rangeValue, kAXValueTypeCFRange, &range);
+        CFRelease(rangeValue);
+    }
+    if (range.length == 0 && range.location > 0) {
+        CFRange previous = CFRangeMake(range.location - 1, 1);
+        AXValueRef selection = AXValueCreate(kAXValueTypeCFRange, &previous);
+        AXUIElementSetAttributeValue(target, kAXSelectedTextRangeAttribute, selection);
+        CFRelease(selection);
+    }
+    AXUIElementSetAttributeValue(target, kAXSelectedTextAttribute, CFSTR(""));
+}
+- (void)handleTakeoverKey:(NSEvent *)event {
+    if (event.keyCode == 53) { [self endTakeover]; return; }                 // Esc hands back
+    if (event.keyCode == 51) { [self deleteBackward]; return; }              // Delete
+    if (event.keyCode == 36 || event.keyCode == 76) {                        // Return / Enter
+        AXUIElementRef target = (__bridge AXUIElementRef)self.takeoverTextElement;
+        if (target && YMElementHasAction(target, kAXConfirmAction)) AXUIElementPerformAction(target, kAXConfirmAction);
+        return;
+    }
+    if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) return;
+    NSString *characters = event.characters;
+    if (characters.length) [self typeText:characters];
+}
+- (void)handleTakeoverScroll:(NSEvent *)event atViewPoint:(NSPoint)point {
+    BOOL valid = NO;
+    CGPoint target = [self takeoverTargetForViewPoint:point valid:&valid];
+    if (!valid) return;
+    AXUIElementRef system = AXUIElementCreateSystemWide();
+    AXUIElementRef hit = NULL;
+    AXUIElementCopyElementAtPosition(system, (float)target.x, (float)target.y, &hit);
+    CFRelease(system);
+    pid_t pid = 0;
+    if (hit) { AXUIElementGetPid(hit, &pid); CFRelease(hit); }
+    if (pid <= 0) return;
+    double scale = event.hasPreciseScrollingDeltas ? 1 : 10;
+    CGEventRef wheel = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2,
+        (int32_t)llround(event.scrollingDeltaY * scale), (int32_t)llround(event.scrollingDeltaX * scale), 0);
+    if (!wheel) return;
+    CGEventSetLocation(wheel, target);
+    CGEventPostToPid(pid, wheel);   // to that app only; the pointer does not move
+    CFRelease(wheel);
 }
 
 #pragma mark Picture in picture
@@ -793,11 +1054,20 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         view.onDoubleClick = ^{ [weakSelf togglePiPSize]; };
         view.closeButton.target = self;
         view.closeButton.action = @selector(closePiPFromButton:);
-        // Takeover stays off until it is verified safe (2026-11-10: hand-back and pointer got stuck).
-        view.takeoverButton.hidden = ![NSUserDefaults.standardUserDefaults boolForKey:@"YMWorkspacePreviewTakeoverEnabled"];
+        view.takeoverAvailable = YMTakeoverEnabled();
         view.takeoverButton.target = self;
         view.takeoverButton.action = @selector(toggleTakeover:);
-        view.onForward = ^(NSEvent *event, NSPoint point) { [weakSelf forwardEvent:event atViewPoint:point]; };
+        view.onTap = ^(NSPoint point, BOOL secondary, NSInteger clicks) {
+            (void)clicks;
+            YMWorkspacePreview *strong = weakSelf;
+            if (!strong.takeoverDisplayID) return;
+            BOOL valid = NO;
+            CGPoint target = [strong takeoverTargetForViewPoint:point valid:&valid];
+            if (valid) [strong tapAtGlobalPoint:target secondary:secondary];
+        };
+        view.onScroll = ^(NSPoint point, NSEvent *event) { [weakSelf handleTakeoverScroll:event atViewPoint:point]; };
+        view.onKey = ^(NSEvent *event) { [weakSelf handleTakeoverKey:event]; };
+        view.onLeftTooLong = ^{ [weakSelf endTakeover]; };
         panel.contentView = view;
         self.pip = panel;
         self.pipView = view;

@@ -23,6 +23,11 @@ NS_ASSUME_NONNULL_BEGIN
 // Display the person is currently controlling through the picture-in-picture
 // panel ("接管"); agents should pause while this is set.
 @property(nonatomic, readonly, nullable) NSNumber *takeoverDisplayID;
+// The takeover input path, also reachable from --display tap/type for testing.
+// tap presses (or focuses, for text) the accessibility element at a global point
+// on a virtual display; type inserts text into the last focused text element.
+- (NSDictionary *)tapAtGlobalPoint:(CGPoint)point secondary:(BOOL)secondary;
+- (NSDictionary *)typeText:(NSString *)text;
 @end
 
 NS_ASSUME_NONNULL_END

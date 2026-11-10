@@ -2698,6 +2698,18 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
     NSString *action = [info[@"action"] isKindOfClass:NSString.class] ? info[@"action"] : @"";
     NSString *name = [info[@"name"] isKindOfClass:NSString.class] ? info[@"name"] : @"";
     if ([action isEqualToString:@"adopt"]) { [self displayCommandAdopt:info requestID:requestID]; return; }
+    if ([action isEqualToString:@"close-window"]) { [self displayCommandCloseWindow:info requestID:requestID]; return; }
+    if ([action isEqualToString:@"tap"]) {
+        if (![info[@"x"] isKindOfClass:NSNumber.class] || ![info[@"y"] isKindOfClass:NSNumber.class]) {
+            [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"--x and --y are required."}]; return;
+        }
+        NSDictionary *result = [self.workspacePreview tapAtGlobalPoint:CGPointMake([info[@"x"] doubleValue], [info[@"y"] doubleValue]) secondary:NO];
+        [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":result}]; return;
+    }
+    if ([action isEqualToString:@"type"]) {
+        NSString *text = [info[@"text"] isKindOfClass:NSString.class] ? info[@"text"] : @"";
+        [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":[self.workspacePreview typeText:text]}]; return;
+    }
     if ([action isEqualToString:@"list"]) {
         NSMutableArray *displays = [NSMutableArray array];
         for (YMManagedDisplay *profile in self.displayProfiles) [displays addObject:[self displayCommandInfoForProfile:profile]];
@@ -2780,6 +2792,43 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
 // native full screen first if needed. Only that window is touched; full-screen
 // state is changed through its own AX element, never through the key window.
 typedef AXError (*YMWindowIDFunction)(AXUIElementRef, CGWindowID *);
+static AXUIElementRef YMCopyAXWindow(pid_t pid, CGWindowID windowID) {
+    static YMWindowIDFunction getWindow;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ getWindow = (YMWindowIDFunction)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    CFArrayRef windows = NULL;
+    AXUIElementRef target = NULL;
+    if (app && getWindow && AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
+        for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+            AXUIElementRef element = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
+            CGWindowID candidate = 0;
+            if (getWindow(element, &candidate) == kAXErrorSuccess && candidate == windowID) { target = (AXUIElementRef)CFRetain(element); break; }
+        }
+    }
+    if (windows) CFRelease(windows);
+    if (app) CFRelease(app);
+    return target;
+}
+// Close one exact window through its own close button (after leaving full screen).
+- (void)displayCommandCloseWindow:(NSDictionary *)info requestID:(NSString *)requestID {
+    pid_t pid = [info[@"pid"] intValue];
+    CGWindowID windowID = [info[@"window"] unsignedIntValue];
+    AXUIElementRef target = (pid > 0 && windowID) ? YMCopyAXWindow(pid, windowID) : NULL;
+    if (!target) { [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Window not found for that process."}]; return; }
+    CFBooleanRef full = NULL;
+    BOOL wasFull = AXUIElementCopyAttributeValue(target, CFSTR("AXFullScreen"), (CFTypeRef *)&full) == kAXErrorSuccess && full && CFBooleanGetValue(full);
+    if (full) CFRelease(full);
+    if (wasFull) AXUIElementSetAttributeValue(target, CFSTR("AXFullScreen"), kCFBooleanFalse);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((wasFull ? 1.2 : 0.05) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        AXUIElementRef button = NULL;
+        BOOL closed = AXUIElementCopyAttributeValue(target, kAXCloseButtonAttribute, (CFTypeRef *)&button) == kAXErrorSuccess && button
+            && AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess;
+        if (button) CFRelease(button);
+        CFRelease(target);
+        [self displayCommandRespond:requestID status:closed ? @"closed" : @"failed" extra:@{@"leftFullScreen":@(wasFull)}];
+    });
+}
 - (void)displayCommandAdopt:(NSDictionary *)info requestID:(NSString *)requestID {
     NSString *name = [info[@"name"] isKindOfClass:NSString.class] ? info[@"name"] : @"";
     pid_t pid = [info[@"pid"] intValue];
@@ -2890,7 +2939,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
                 userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
             return 0;
         }
-        if (![@[@"list", @"start", @"close", @"adopt"] containsObject:action]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
             if (index + 1 >= argc) return YMDisplayCommandUsage();
@@ -2901,9 +2950,12 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
             else if ([key isEqualToString:@"--hidpi"]) message[@"hiDPI"] = @(value.boolValue);
             else if ([key isEqualToString:@"--pid"]) message[@"pid"] = @(value.intValue);
             else if ([key isEqualToString:@"--window"]) message[@"window"] = @(value.longLongValue);
+            else if ([key isEqualToString:@"--x"]) message[@"x"] = @(value.doubleValue);
+            else if ([key isEqualToString:@"--y"]) message[@"y"] = @(value.doubleValue);
+            else if ([key isEqualToString:@"--text"]) message[@"text"] = value;
             else return YMDisplayCommandUsage();
         }
-        if (![action isEqualToString:@"list"] && ![message[@"name"] length]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"tap", @"type", @"close-window"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
         NSString *requestID = NSUUID.UUID.UUIDString.lowercaseString;
         message[@"requestID"] = requestID;
         __block NSDictionary *reply = nil;
