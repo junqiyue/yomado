@@ -348,10 +348,18 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
     self.onForward(event, point);
     return YES;
 }
-- (void)mouseDown:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseDown:event]; }
-- (void)mouseDragged:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseDragged:event]; }
+// Presses are swallowed and replayed as one complete click on release. Replaying
+// a press while the physical button is still down hands that press to the
+// target app and leaves the system in a stuck drag (seen 2026-11-10).
+- (BOOL)swallowIfTakingOver:(NSEvent *)event {
+    if (!self.takeover) return NO;
+    NSView *hit = [self hitTest:[self.superview convertPoint:event.locationInWindow fromView:nil]];
+    return ![hit isKindOfClass:NSButton.class];
+}
+- (void)mouseDown:(NSEvent *)event { if (![self swallowIfTakingOver:event]) [super mouseDown:event]; }
+- (void)mouseDragged:(NSEvent *)event { if (![self swallowIfTakingOver:event]) [super mouseDragged:event]; }
 - (void)mouseUp:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseUp:event]; }
-- (void)rightMouseDown:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super rightMouseDown:event]; }
+- (void)rightMouseDown:(NSEvent *)event { if (![self swallowIfTakingOver:event]) [super rightMouseDown:event]; }
 - (void)rightMouseUp:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super rightMouseUp:event]; }
 - (void)scrollWheel:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super scrollWheel:event]; }
 - (void)layout {
@@ -708,30 +716,37 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
     CGEventRef now = CGEventCreate(NULL);
     CGPoint back = now ? CGEventGetLocation(now) : CGPointZero;
     if (now) CFRelease(now);
-    CGEventRef replay = NULL;
-    switch (event.type) {
-        case NSEventTypeLeftMouseDown: replay = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, target, kCGMouseButtonLeft); break;
-        case NSEventTypeLeftMouseUp: replay = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, target, kCGMouseButtonLeft); break;
-        case NSEventTypeLeftMouseDragged: replay = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDragged, target, kCGMouseButtonLeft); break;
-        case NSEventTypeRightMouseDown: replay = CGEventCreateMouseEvent(NULL, kCGEventRightMouseDown, target, kCGMouseButtonRight); break;
-        case NSEventTypeRightMouseUp: replay = CGEventCreateMouseEvent(NULL, kCGEventRightMouseUp, target, kCGMouseButtonRight); break;
-        case NSEventTypeScrollWheel: {
-            double scale = event.hasPreciseScrollingDeltas ? 1 : 10;
-            replay = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2,
-                (int32_t)llround(event.scrollingDeltaY * scale), (int32_t)llround(event.scrollingDeltaX * scale), 0);
-            break;
+    // Never replay while a physical button is still held.
+    if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft)
+        || CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonRight)) return;
+    NSMutableArray *events = [NSMutableArray array];
+    BOOL click = NO;
+    if (event.type == NSEventTypeLeftMouseUp || event.type == NSEventTypeRightMouseUp) {
+        BOOL right = event.type == NSEventTypeRightMouseUp;
+        CGMouseButton button = right ? kCGMouseButtonRight : kCGMouseButtonLeft;
+        CGEventRef down = CGEventCreateMouseEvent(NULL, right ? kCGEventRightMouseDown : kCGEventLeftMouseDown, target, button);
+        CGEventRef up = CGEventCreateMouseEvent(NULL, right ? kCGEventRightMouseUp : kCGEventLeftMouseUp, target, button);
+        for (id pair in @[(__bridge id)down, (__bridge id)up]) {
+            CGEventSetIntegerValueField((__bridge CGEventRef)pair, kCGMouseEventClickState, MAX(1, event.clickCount));
+            [events addObject:pair];
         }
-        default: break;
+        CFRelease(down); CFRelease(up);
+        click = YES;
+    } else if (event.type == NSEventTypeScrollWheel) {
+        double scale = event.hasPreciseScrollingDeltas ? 1 : 10;
+        CGEventRef wheel = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2,
+            (int32_t)llround(event.scrollingDeltaY * scale), (int32_t)llround(event.scrollingDeltaX * scale), 0);
+        if (wheel) { [events addObject:(__bridge id)wheel]; CFRelease(wheel); }
     }
-    if (!replay) return;
-    if (event.type != NSEventTypeScrollWheel) CGEventSetIntegerValueField(replay, kCGMouseEventClickState, event.clickCount);
+    if (!events.count) return;
     CGWarpMouseCursorPosition(target);
-    CGEventSetLocation(replay, target);
-    CGEventPost(kCGHIDEventTap, replay);
-    CFRelease(replay);
+    for (id replay in events) {
+        CGEventSetLocation((__bridge CGEventRef)replay, target);
+        CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)replay);
+    }
     CGWarpMouseCursorPosition(back);
     CGAssociateMouseAndMouseCursorPosition(true);
-    if (event.type == NSEventTypeLeftMouseDown || event.type == NSEventTypeRightMouseDown) [self markPoint:target];
+    if (click) [self markPoint:target];
 }
 
 #pragma mark Picture in picture
