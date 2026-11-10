@@ -291,8 +291,12 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 // Picture-in-picture content: live picture; a glass toolbar fades in on hover.
 // While the person has taken over, the toolbar and a status pill stay visible
 // and an accent ring marks the panel.
-@interface YMPiPView : YMPreviewHitView
+@interface YMPiPView : YMPreviewHitView <NSTextInputClient>
 @property(nonatomic) CALayer *picture;
+@property(nonatomic) NSMutableAttributedString *marked;
+@property(nonatomic, copy, nullable) void (^onInsert)(NSString *text);
+@property(nonatomic, copy, nullable) void (^onCommand)(NSString *command);
+@property(nonatomic, copy, nullable) void (^onMarked)(NSString *text);
 @property(nonatomic) NSView *bar;
 @property(nonatomic) NSTextField *title;
 @property(nonatomic) NSButton *closeButton;
@@ -464,10 +468,61 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
     if (self.takeover && self.onScroll) { self.onScroll([self convertPoint:event.locationInWindow fromView:nil], event); return; }
     [super scrollWheel:event];
 }
+// Keys go through the system input method, so Pinyin and other IMEs compose
+// as usual; the committed text is written into the virtual display's field.
 - (void)keyDown:(NSEvent *)event {
-    if (self.takeover && self.onKey) { self.onKey(event); return; }
-    [super keyDown:event];
+    if (!self.takeover) { [super keyDown:event]; return; }
+    NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if (flags & NSEventModifierFlagCommand) {
+        if ([event.charactersIgnoringModifiers.lowercaseString isEqualToString:@"v"] && self.onCommand) self.onCommand(@"paste");
+        return;
+    }
+    [self interpretKeyEvents:@[event]];
 }
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if (self.takeover && (event.modifierFlags & NSEventModifierFlagCommand)
+        && [event.charactersIgnoringModifiers.lowercaseString isEqualToString:@"v"]) {
+        if (self.onCommand) self.onCommand(@"paste");
+        return YES;
+    }
+    return [super performKeyEquivalent:event];
+}
+- (void)insertText:(id)string replacementRange:(NSRange)range {
+    (void)range;
+    NSString *text = [string isKindOfClass:NSAttributedString.class] ? [string string] : string;
+    [self unmarkText];
+    if (text.length && self.onInsert) self.onInsert(text);
+}
+- (void)doCommandBySelector:(SEL)selector {
+    NSString *command = nil;
+    if (selector == @selector(deleteBackward:)) command = @"delete";
+    else if (selector == @selector(insertNewline:)) command = @"return";
+    else if (selector == @selector(cancelOperation:)) command = @"escape";
+    if (command && self.onCommand) self.onCommand(command);
+}
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selected replacementRange:(NSRange)range {
+    (void)selected; (void)range;
+    self.marked = [[NSMutableAttributedString alloc] initWithString:[string isKindOfClass:NSAttributedString.class] ? [string string] : string];
+    if (self.onMarked) self.onMarked(self.marked.string);
+}
+- (void)unmarkText {
+    self.marked = nil;
+    if (self.onMarked) self.onMarked(@"");
+}
+- (NSRange)selectedRange { return NSMakeRange(self.marked.length, 0); }
+- (NSRange)markedRange { return self.marked.length ? NSMakeRange(0, self.marked.length) : NSMakeRange(NSNotFound, 0); }
+- (BOOL)hasMarkedText { return self.marked.length > 0; }
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    (void)range; (void)actual; return nil;
+}
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    (void)range; (void)actual;
+    // Candidate window sits under the status pill.
+    NSRect local = NSMakeRect(NSMidX(self.pill.frame) - 40, NSMinY(self.pill.frame) - 4, 80, 20);
+    return [self.window convertRectToScreen:[self convertRect:local toView:nil]];
+}
+- (NSUInteger)characterIndexForPoint:(NSPoint)point { (void)point; return NSNotFound; }
 @end
 
 #pragma mark - Controller
@@ -489,6 +544,8 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 @property(nonatomic) BOOL permissionMissing;
 @property(nonatomic, readwrite, nullable) NSNumber *takeoverDisplayID;
 @property(nonatomic, nullable) id takeoverTextElement;
+@property(nonatomic, nullable) id fenceGlobalMonitor;
+@property(nonatomic, nullable) id fenceLocalMonitor;
 @end
 
 @implementation YMWorkspacePreview
@@ -506,6 +563,8 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 }
 - (void)invalidate {
     [NSNotificationCenter.defaultCenter removeObserver:self];
+    self.displays = @[];
+    [self updateCursorFence];
     [self teardown];
 }
 - (void)setEnabled:(BOOL)enabled {
@@ -538,6 +597,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 }
 
 - (void)reconcile {
+    [self updateCursorFence];
     if (!self.enabled || !self.displays.count) { [self teardown]; return; }
     NSMutableSet *wanted = [NSMutableSet set];
     for (NSDictionary *display in self.displays) [wanted addObject:display[@"displayID"]];
@@ -749,6 +809,56 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         }
         return;
     }
+}
+
+
+#pragma mark Cursor fence
+
+// Virtual displays are part of the desktop, so the person's pointer can slide
+// past a physical edge into a screen they cannot see and appear lost. Agents
+// never use the real pointer, so keep it on physical displays: whenever it
+// enters a virtual display, put it back at the nearest physical point.
+- (void)updateCursorFence {
+    id setting = [NSUserDefaults.standardUserDefaults objectForKey:@"YMCursorFenceEnabled"];
+    BOOL want = self.displays.count > 0 && (setting == nil || [setting boolValue]);   // on unless turned off
+    if (want && !self.fenceGlobalMonitor) {
+        __weak YMWorkspacePreview *weakSelf = self;
+        NSEventMask mask = NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged;
+        self.fenceGlobalMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:mask handler:^(NSEvent *event) { (void)event; [weakSelf enforceCursorFence]; }];
+        self.fenceLocalMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent *(NSEvent *event) { [weakSelf enforceCursorFence]; return event; }];
+        [self enforceCursorFence];
+    } else if (!want && self.fenceGlobalMonitor) {
+        [NSEvent removeMonitor:self.fenceGlobalMonitor];
+        if (self.fenceLocalMonitor) [NSEvent removeMonitor:self.fenceLocalMonitor];
+        self.fenceGlobalMonitor = nil;
+        self.fenceLocalMonitor = nil;
+    }
+}
+- (void)enforceCursorFence {
+    CGEventRef now = CGEventCreate(NULL);
+    if (!now) return;
+    CGPoint point = CGEventGetLocation(now);
+    CFRelease(now);
+    BOOL inside = NO;
+    for (NSDictionary *display in self.displays)
+        if (CGRectContainsPoint(CGDisplayBounds([display[@"displayID"] unsignedIntValue]), point)) inside = YES;
+    if (!inside) return;
+    uint32_t count = 0;
+    CGDirectDisplayID ids[16];
+    if (CGGetActiveDisplayList(16, ids, &count) != kCGErrorSuccess) return;
+    CGPoint best = CGPointZero;
+    double bestDistance = INFINITY;
+    for (uint32_t index = 0; index < count; index++) {
+        if ([VDVirtualDisplay isVirtualDisplay:ids[index]]) continue;
+        CGRect bounds = CGDisplayBounds(ids[index]);
+        CGPoint clamped = CGPointMake(MIN(MAX(point.x, CGRectGetMinX(bounds)), CGRectGetMaxX(bounds) - 2),
+                                      MIN(MAX(point.y, CGRectGetMinY(bounds)), CGRectGetMaxY(bounds) - 2));
+        double distance = hypot(clamped.x - point.x, clamped.y - point.y);
+        if (distance < bestDistance) { bestDistance = distance; best = clamped; }
+    }
+    if (!isfinite(bestDistance)) return;
+    CGWarpMouseCursorPosition(best);
+    CGAssociateMouseAndMouseCursorPosition(true);
 }
 
 #pragma mark Takeover
@@ -997,17 +1107,24 @@ static NSString *YMElementValue(AXUIElementRef element) {
     NSRange last = [current rangeOfComposedCharacterSequenceAtIndex:current.length - 1];
     AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)[current substringToIndex:last.location]);
 }
-- (void)handleTakeoverKey:(NSEvent *)event {
-    if (event.keyCode == 53) { [self endTakeover]; return; }                 // Esc hands back
-    if (event.keyCode == 51) { [self deleteBackward]; return; }              // Delete
-    if (event.keyCode == 36 || event.keyCode == 76) {                        // Return / Enter
-        AXUIElementRef target = (__bridge AXUIElementRef)self.takeoverTextElement;
-        if (target && YMElementHasAction(target, kAXConfirmAction)) AXUIElementPerformAction(target, kAXConfirmAction);
+- (void)handleTakeoverCommand:(NSString *)command {
+    if ([command isEqualToString:@"escape"]) { [self endTakeover]; return; }
+    if ([command isEqualToString:@"delete"]) { [self deleteBackward]; return; }
+    if ([command isEqualToString:@"paste"]) {
+        NSString *text = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+        if (text.length) [self typeText:text];
         return;
     }
-    if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) return;
-    NSString *characters = event.characters;
-    if (characters.length) [self typeText:characters];
+    if ([command isEqualToString:@"return"]) {
+        AXUIElementRef target = (__bridge AXUIElementRef)self.takeoverTextElement;
+        if (target && YMElementHasAction(target, kAXConfirmAction)) AXUIElementPerformAction(target, kAXConfirmAction);
+    }
+}
+- (void)showComposition:(NSString *)text {
+    self.pipView.pillLabel.stringValue = text.length
+        ? [NSString stringWithFormat:@"输入中：%@", text]
+        : @"你正在操作 · Agent 已暂停 · 按 Esc 交还";
+    self.pipView.needsLayout = YES;
 }
 - (void)handleTakeoverScroll:(NSEvent *)event atViewPoint:(NSPoint)point {
     BOOL valid = NO;
@@ -1089,7 +1206,9 @@ static NSString *YMElementValue(AXUIElementRef element) {
             if (valid) [strong tapAtGlobalPoint:target secondary:secondary];
         };
         view.onScroll = ^(NSPoint point, NSEvent *event) { [weakSelf handleTakeoverScroll:event atViewPoint:point]; };
-        view.onKey = ^(NSEvent *event) { [weakSelf handleTakeoverKey:event]; };
+        view.onInsert = ^(NSString *text) { [weakSelf typeText:text]; };
+        view.onCommand = ^(NSString *command) { [weakSelf handleTakeoverCommand:command]; };
+        view.onMarked = ^(NSString *text) { [weakSelf showComposition:text]; };
         view.onLeftTooLong = ^{ [weakSelf endTakeover]; };
         panel.contentView = view;
         self.pip = panel;

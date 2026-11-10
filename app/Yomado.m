@@ -2706,6 +2706,31 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
         NSDictionary *result = [self.workspacePreview tapAtGlobalPoint:CGPointMake([info[@"x"] doubleValue], [info[@"y"] doubleValue]) secondary:NO];
         [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":result}]; return;
     }
+    if ([action isEqualToString:@"fence-test"]) {
+        // Self-test: move the pointer into the named display once, then confirm
+        // the fence put it back on a physical screen. Always restores the start point.
+        YMManagedDisplay *profile = [self displayCommandProfileNamed:name.length ? name : @"Claude"];
+        if (!profile.display.isCreated) { [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Display is not running."}]; return; }
+        CGEventRef now = CGEventCreate(NULL);
+        CGPoint start = now ? CGEventGetLocation(now) : CGPointZero;
+        if (now) CFRelease(now);
+        CGRect bounds = CGDisplayBounds(profile.display.displayID);
+        CGPoint inside = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+        CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, inside, kCGMouseButtonLeft);
+        CGEventPost(kCGHIDEventTap, move);
+        CFRelease(move);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            CGEventRef later = CGEventCreate(NULL);
+            CGPoint after = later ? CGEventGetLocation(later) : CGPointZero;
+            if (later) CFRelease(later);
+            BOOL fenced = !CGRectContainsPoint(bounds, after);
+            CGWarpMouseCursorPosition(start);
+            CGAssociateMouseAndMouseCursorPosition(true);
+            [self displayCommandRespond:requestID status:fenced ? @"ok" : @"failed"
+                extra:@{@"after":NSStringFromPoint(NSPointFromCGPoint(after)), @"fenced":@(fenced)}];
+        });
+        return;
+    }
     if ([action isEqualToString:@"scroll"]) {
         NSDictionary *result = [self.workspacePreview scrollAtGlobalPoint:CGPointMake([info[@"x"] doubleValue], [info[@"y"] doubleValue])
             dx:0 dy:[info[@"dy"] doubleValue]];
@@ -2944,7 +2969,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
                 userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
             return 0;
         }
-        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window", @"scroll"] containsObject:action]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window", @"scroll", @"fence-test"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
             if (index + 1 >= argc) return YMDisplayCommandUsage();
@@ -2961,7 +2986,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
             else if ([key isEqualToString:@"--dy"]) message[@"dy"] = @(value.doubleValue);
             else return YMDisplayCommandUsage();
         }
-        if (![@[@"list", @"tap", @"type", @"close-window", @"scroll"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"tap", @"type", @"close-window", @"scroll", @"fence-test"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
         NSString *requestID = NSUUID.UUID.UUIDString.lowercaseString;
         message[@"requestID"] = requestID;
         __block NSDictionary *reply = nil;
