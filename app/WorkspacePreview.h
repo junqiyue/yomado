@@ -20,6 +20,9 @@ NS_ASSUME_NONNULL_BEGIN
 // Show a short ripple where an agent just acted. point is in global desktop
 // coordinates (origin top-left of the main display, as CGDisplayBounds).
 - (void)markPoint:(CGPoint)point;
+// Display the person is currently controlling through the picture-in-picture
+// panel ("接管"); agents should pause while this is set.
+@property(nonatomic, readonly, nullable) NSNumber *takeoverDisplayID;
 @end
 
 NS_ASSUME_NONNULL_END

@@ -2671,6 +2671,8 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
         @"width":@(profile.width), @"height":@(profile.height), @"hiDPI":@(profile.hiDPI),
         @"running":@(profile.display.isCreated && profile.topologyVerified), @"starting":@(profile.starting)} mutableCopy];
     if (profile.startFailureText.length) info[@"failure"] = profile.startFailureText;
+    // The person is driving this display from the preview; agents must pause.
+    info[@"takeover"] = @(profile.display.isCreated && [self.workspacePreview.takeoverDisplayID isEqual:@(profile.display.displayID)]);
     if (profile.display.isCreated) {
         CGDirectDisplayID ident = profile.display.displayID;
         CGRect bounds = CGDisplayBounds(ident);
@@ -2813,29 +2815,35 @@ typedef AXError (*YMWindowIDFunction)(AXUIElementRef, CGWindowID *);
     CGRect bounds = CGDisplayBounds(profile.display.displayID);
     NSDictionary *profileInfo = [self displayCommandInfoForProfile:profile];
     // Full-screen exit animates for about a second; then place the window.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((wasFull ? 1.2 : 0.05) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        CGPoint origin = CGPointMake(bounds.origin.x + 8, bounds.origin.y + 32);
-        CGSize size = CGSizeMake(bounds.size.width - 16, bounds.size.height - 40);
-        BOOL placed = NO;
-        for (int attempt = 0; attempt < 3 && !placed; attempt++) {
-            AXValueRef sizeValue = AXValueCreate(kAXValueTypeCGSize, &size);
-            AXValueRef originValue = AXValueCreate(kAXValueTypeCGPoint, &origin);
-            AXUIElementSetAttributeValue(target, kAXPositionAttribute, originValue);
-            AXUIElementSetAttributeValue(target, kAXSizeAttribute, sizeValue);
-            AXUIElementSetAttributeValue(target, kAXPositionAttribute, originValue);
-            CFRelease(sizeValue); CFRelease(originValue);
+    CGPoint origin = CGPointMake(bounds.origin.x + 8, bounds.origin.y + 32);
+    CGSize size = CGSizeMake(bounds.size.width - 16, bounds.size.height - 40);
+    // WindowServer can pull a window back toward its old screen after an
+    // accepted move; confirm after it settles and retry a few times.
+    __block void (^attempt)(int) = nil;
+    __weak typeof(self) weakSelf = self;
+    attempt = ^(int remaining) {
+        AXValueRef sizeValue = AXValueCreate(kAXValueTypeCGSize, &size);
+        AXValueRef originValue = AXValueCreate(kAXValueTypeCGPoint, &origin);
+        AXUIElementSetAttributeValue(target, kAXPositionAttribute, originValue);
+        AXUIElementSetAttributeValue(target, kAXSizeAttribute, sizeValue);
+        AXUIElementSetAttributeValue(target, kAXPositionAttribute, originValue);
+        CFRelease(sizeValue); CFRelease(originValue);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             AXValueRef current = NULL;
             CGPoint now = CGPointZero;
             if (AXUIElementCopyAttributeValue(target, kAXPositionAttribute, (CFTypeRef *)&current) == kAXErrorSuccess && current) {
                 AXValueGetValue(current, kAXValueTypeCGPoint, &now);
                 CFRelease(current);
             }
-            placed = CGRectContainsPoint(bounds, CGPointMake(now.x + 1, now.y + 1));
-        }
-        CFRelease(target);
-        [self displayCommandRespond:requestID status:placed ? @"adopted" : @"failed"
-            extra:@{@"display":profileInfo, @"leftFullScreen":@(wasFull), @"message":placed ? @"" : @"Window did not move onto the display."}];
-    });
+            BOOL placed = now.x >= bounds.origin.x && now.x < CGRectGetMaxX(bounds) && CGRectContainsPoint(bounds, CGPointMake(now.x + 1, now.y + 1));
+            if (!placed && remaining > 1) { attempt(remaining - 1); return; }
+            CFRelease(target);
+            attempt = nil;
+            [weakSelf displayCommandRespond:requestID status:placed ? @"adopted" : @"failed"
+                extra:@{@"display":profileInfo, @"leftFullScreen":@(wasFull), @"message":placed ? @"" : @"Window did not stay on the display."}];
+        });
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((wasFull ? 1.2 : 0.05) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ attempt(4); });
 }
 - (void)displayCommandAwait:(YMManagedDisplay *)profile requestID:(NSString *)requestID running:(BOOL)wantRunning deadline:(NSDate *)deadline {
     BOOL running = profile.display.isCreated && profile.topologyVerified;

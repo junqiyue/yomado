@@ -5,6 +5,7 @@
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <ApplicationServices/ApplicationServices.h>
 
 static NSString *const YMPreviewEnabledKey = @"YMWorkspacePreviewEnabled";
 static NSString *const YMPreviewPiPFrameKey = @"YMWorkspacePreviewPiPFrame";
@@ -291,6 +292,9 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 @property(nonatomic) NSView *bar;
 @property(nonatomic) NSTextField *title;
 @property(nonatomic) NSButton *closeButton;
+@property(nonatomic) NSButton *takeoverButton;
+@property(nonatomic) BOOL takeover;
+@property(nonatomic, copy, nullable) void (^onForward)(NSEvent *event, NSPoint point);
 @end
 @implementation YMPiPView
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -317,16 +321,47 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         _closeButton.contentTintColor = [NSColor colorWithWhite:1 alpha:0.9];
         _closeButton.toolTip = @"收起预览";
         [_bar addSubview:_closeButton];
+        _takeoverButton = [NSButton buttonWithTitle:@"接管" target:nil action:nil];
+        _takeoverButton.bezelStyle = NSBezelStyleInline;
+        _takeoverButton.controlSize = NSControlSizeSmall;
+        _takeoverButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+        _takeoverButton.toolTip = @"在这个画面里直接操作虚拟屏;Agent 会暂停";
+        [_bar addSubview:_takeoverButton];
     }
     return self;
 }
+- (void)setTakeover:(BOOL)takeover {
+    _takeover = takeover;
+    self.layer.borderWidth = takeover ? 3 : 0;
+    self.layer.borderColor = NSColor.controlAccentColor.CGColor;
+    self.takeoverButton.title = takeover ? @"交还" : @"接管";
+    self.takeoverButton.toolTip = takeover ? @"交还给 Agent" : @"在这个画面里直接操作虚拟屏;Agent 会暂停";
+    self.bar.alphaValue = takeover ? 1 : self.bar.alphaValue;
+    [self needsLayout];
+}
+- (BOOL)mouseDownCanMoveWindow { return !self.takeover; }
+- (BOOL)forwardIfTakingOver:(NSEvent *)event {
+    if (!self.takeover || !self.onForward) return NO;
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    NSView *hit = [self hitTest:[self.superview convertPoint:event.locationInWindow fromView:nil]];
+    if ([hit isKindOfClass:NSButton.class]) return NO;
+    self.onForward(event, point);
+    return YES;
+}
+- (void)mouseDown:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseDown:event]; }
+- (void)mouseDragged:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseDragged:event]; }
+- (void)mouseUp:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super mouseUp:event]; }
+- (void)rightMouseDown:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super rightMouseDown:event]; }
+- (void)rightMouseUp:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super rightMouseUp:event]; }
+- (void)scrollWheel:(NSEvent *)event { if (![self forwardIfTakingOver:event]) [super scrollWheel:event]; }
 - (void)layout {
     [super layout];
     self.picture.frame = self.layer.bounds;
     CGFloat height = 40;
     self.bar.frame = NSMakeRect(0, self.bounds.size.height - height, self.bounds.size.width, height);
-    self.title.frame = NSMakeRect(14, 12, self.bounds.size.width - 60, 16);
+    self.title.frame = NSMakeRect(14, 12, self.bounds.size.width - 130, 16);
     self.closeButton.frame = NSMakeRect(self.bounds.size.width - 34, 10, 20, 20);
+    self.takeoverButton.frame = NSMakeRect(self.bounds.size.width - 92, 9, 52, 22);
 }
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
@@ -335,7 +370,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil]];
 }
 - (void)mouseEntered:(NSEvent *)event { (void)event; YMAnimate(0.18, ^{ self.bar.animator.alphaValue = 1; }, nil); }
-- (void)mouseExited:(NSEvent *)event { (void)event; YMAnimate(0.25, ^{ self.bar.animator.alphaValue = 0; }, nil); }
+- (void)mouseExited:(NSEvent *)event { (void)event; if (!self.takeover) YMAnimate(0.25, ^{ self.bar.animator.alphaValue = 0; }, nil); }
 @end
 
 #pragma mark - Controller
@@ -355,6 +390,9 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 @property(nonatomic, nullable) YMPiPView *pipView;
 @property(nonatomic, nullable) NSNumber *pipDisplayID;
 @property(nonatomic) BOOL permissionMissing;
+@property(nonatomic, readwrite, nullable) NSNumber *takeoverDisplayID;
+@property(nonatomic, nullable) NSRunningApplication *takeoverPreviousApp;
+@property(nonatomic, nullable) id takeoverPreviousWindow;
 @end
 
 @implementation YMWorkspacePreview
@@ -617,6 +655,85 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
     }
 }
 
+#pragma mark Takeover
+
+// The person drives the virtual display from the picture-in-picture panel.
+// Each mouse event is replayed at the matching point on the virtual display
+// and the pointer is put straight back over the panel, so the person keeps
+// their place. Clicking there activates the target app, so the physical
+// keyboard types into it directly. Handing back restores the app and window
+// that had focus before.
+- (void)toggleTakeover:(id)sender {
+    (void)sender;
+    if (self.takeoverDisplayID) [self endTakeover]; else [self beginTakeover];
+}
+- (void)beginTakeover {
+    if (!self.pipDisplayID || !AXIsProcessTrusted()) return;
+    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+    self.takeoverPreviousApp = front;
+    self.takeoverPreviousWindow = nil;
+    if (front) {
+        AXUIElementRef app = AXUIElementCreateApplication(front.processIdentifier);
+        CFTypeRef window = NULL;
+        if (app && AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &window) == kAXErrorSuccess && window)
+            self.takeoverPreviousWindow = CFBridgingRelease(window);
+        if (app) CFRelease(app);
+    }
+    self.takeoverDisplayID = self.pipDisplayID;
+    self.pipView.takeover = YES;
+    self.pipView.title.stringValue = [NSString stringWithFormat:@"你在操作 %@ · Agent 已暂停", [self nameForDisplayID:self.pipDisplayID]];
+}
+- (void)endTakeover {
+    if (!self.takeoverDisplayID) return;
+    self.takeoverDisplayID = nil;
+    self.pipView.takeover = NO;
+    if (self.pipDisplayID) self.pipView.title.stringValue = [self nameForDisplayID:self.pipDisplayID];
+    NSRunningApplication *previous = self.takeoverPreviousApp;
+    if (previous && !previous.terminated) {
+        AXUIElementRef app = AXUIElementCreateApplication(previous.processIdentifier);
+        if (self.takeoverPreviousWindow) AXUIElementPerformAction((__bridge AXUIElementRef)self.takeoverPreviousWindow, kAXRaiseAction);
+        if (app) { AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue); CFRelease(app); }
+    }
+    self.takeoverPreviousApp = nil;
+    self.takeoverPreviousWindow = nil;
+}
+- (void)forwardEvent:(NSEvent *)event atViewPoint:(NSPoint)point {
+    if (!self.takeoverDisplayID) return;
+    CGRect bounds = CGDisplayBounds(self.takeoverDisplayID.unsignedIntValue);
+    CGRect fit = YMAspectFitRect(bounds.size, self.pipView.picture.bounds);
+    CGFloat nx = (point.x - fit.origin.x) / fit.size.width;
+    CGFloat ny = 1 - (point.y - fit.origin.y) / fit.size.height;
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
+    CGPoint target = CGPointMake(bounds.origin.x + nx * bounds.size.width, bounds.origin.y + ny * bounds.size.height);
+    CGEventRef now = CGEventCreate(NULL);
+    CGPoint back = now ? CGEventGetLocation(now) : CGPointZero;
+    if (now) CFRelease(now);
+    CGEventRef replay = NULL;
+    switch (event.type) {
+        case NSEventTypeLeftMouseDown: replay = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, target, kCGMouseButtonLeft); break;
+        case NSEventTypeLeftMouseUp: replay = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, target, kCGMouseButtonLeft); break;
+        case NSEventTypeLeftMouseDragged: replay = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDragged, target, kCGMouseButtonLeft); break;
+        case NSEventTypeRightMouseDown: replay = CGEventCreateMouseEvent(NULL, kCGEventRightMouseDown, target, kCGMouseButtonRight); break;
+        case NSEventTypeRightMouseUp: replay = CGEventCreateMouseEvent(NULL, kCGEventRightMouseUp, target, kCGMouseButtonRight); break;
+        case NSEventTypeScrollWheel: {
+            double scale = event.hasPreciseScrollingDeltas ? 1 : 10;
+            replay = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2,
+                (int32_t)llround(event.scrollingDeltaY * scale), (int32_t)llround(event.scrollingDeltaX * scale), 0);
+            break;
+        }
+        default: break;
+    }
+    if (!replay) return;
+    if (event.type != NSEventTypeScrollWheel) CGEventSetIntegerValueField(replay, kCGMouseEventClickState, event.clickCount);
+    CGWarpMouseCursorPosition(target);
+    CGEventSetLocation(replay, target);
+    CGEventPost(kCGHIDEventTap, replay);
+    CFRelease(replay);
+    CGWarpMouseCursorPosition(back);
+    CGAssociateMouseAndMouseCursorPosition(true);
+    if (event.type == NSEventTypeLeftMouseDown || event.type == NSEventTypeRightMouseDown) [self markPoint:target];
+}
+
 #pragma mark Picture in picture
 
 - (NSString *)nameForDisplayID:(NSNumber *)ident {
@@ -637,6 +754,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 - (void)openPiPForDisplayID:(NSNumber *)ident {
     [self collapseDock];
     if (self.pipDisplayID && ![self.pipDisplayID isEqual:ident]) {
+        [self endTakeover];
         YMPreviewSource *previous = self.sources[self.pipDisplayID];
         [previous detachLayer:self.pipView.picture];
         previous.live = NO;
@@ -659,6 +777,9 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         view.onDoubleClick = ^{ [weakSelf togglePiPSize]; };
         view.closeButton.target = self;
         view.closeButton.action = @selector(closePiPFromButton:);
+        view.takeoverButton.target = self;
+        view.takeoverButton.action = @selector(toggleTakeover:);
+        view.onForward = ^(NSEvent *event, NSPoint point) { [weakSelf forwardEvent:event atViewPoint:point]; };
         panel.contentView = view;
         self.pip = panel;
         self.pipView = view;
@@ -698,6 +819,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 
 - (void)closePiP {
     if (!self.pip) return;
+    [self endTakeover];
     if (self.pipDisplayID) {
         YMPreviewSource *source = self.sources[self.pipDisplayID];
         [source detachLayer:self.pipView.picture];
