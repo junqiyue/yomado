@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
@@ -2694,6 +2695,7 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
     }
     NSString *action = [info[@"action"] isKindOfClass:NSString.class] ? info[@"action"] : @"";
     NSString *name = [info[@"name"] isKindOfClass:NSString.class] ? info[@"name"] : @"";
+    if ([action isEqualToString:@"adopt"]) { [self displayCommandAdopt:info requestID:requestID]; return; }
     if ([action isEqualToString:@"list"]) {
         NSMutableArray *displays = [NSMutableArray array];
         for (YMManagedDisplay *profile in self.displayProfiles) [displays addObject:[self displayCommandInfoForProfile:profile]];
@@ -2772,6 +2774,69 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
     }
     [self displayCommandAwait:profile requestID:requestID running:NO deadline:deadline];
 }
+// Move one exact window (by CGWindowID) onto a running work screen, leaving
+// native full screen first if needed. Only that window is touched; full-screen
+// state is changed through its own AX element, never through the key window.
+typedef AXError (*YMWindowIDFunction)(AXUIElementRef, CGWindowID *);
+- (void)displayCommandAdopt:(NSDictionary *)info requestID:(NSString *)requestID {
+    NSString *name = [info[@"name"] isKindOfClass:NSString.class] ? info[@"name"] : @"";
+    pid_t pid = [info[@"pid"] intValue];
+    CGWindowID windowID = [info[@"window"] unsignedIntValue];
+    YMManagedDisplay *profile = [self displayCommandProfileNamed:name];
+    if (!profile.display.isCreated || !profile.topologyVerified) {
+        [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Display is not running."}]; return;
+    }
+    if (pid <= 0 || !windowID || !AXIsProcessTrusted()) {
+        [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Need --pid, --window and Accessibility access."}]; return;
+    }
+    static YMWindowIDFunction getWindow;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ getWindow = (YMWindowIDFunction)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    CFArrayRef windows = NULL;
+    AXUIElementRef target = NULL;
+    if (app && getWindow && AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
+        for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+            AXUIElementRef element = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
+            CGWindowID candidate = 0;
+            if (getWindow(element, &candidate) == kAXErrorSuccess && candidate == windowID) { target = (AXUIElementRef)CFRetain(element); break; }
+        }
+    }
+    if (windows) CFRelease(windows);
+    if (app) CFRelease(app);
+    if (!target) { [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Window not found for that process."}]; return; }
+    CFBooleanRef fullScreen = NULL;
+    BOOL wasFull = AXUIElementCopyAttributeValue(target, CFSTR("AXFullScreen"), (CFTypeRef *)&fullScreen) == kAXErrorSuccess
+        && fullScreen && CFBooleanGetValue(fullScreen);
+    if (fullScreen) CFRelease(fullScreen);
+    if (wasFull) AXUIElementSetAttributeValue(target, CFSTR("AXFullScreen"), kCFBooleanFalse);
+    CGRect bounds = CGDisplayBounds(profile.display.displayID);
+    NSDictionary *profileInfo = [self displayCommandInfoForProfile:profile];
+    // Full-screen exit animates for about a second; then place the window.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((wasFull ? 1.2 : 0.05) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        CGPoint origin = CGPointMake(bounds.origin.x + 8, bounds.origin.y + 32);
+        CGSize size = CGSizeMake(bounds.size.width - 16, bounds.size.height - 40);
+        BOOL placed = NO;
+        for (int attempt = 0; attempt < 3 && !placed; attempt++) {
+            AXValueRef sizeValue = AXValueCreate(kAXValueTypeCGSize, &size);
+            AXValueRef originValue = AXValueCreate(kAXValueTypeCGPoint, &origin);
+            AXUIElementSetAttributeValue(target, kAXPositionAttribute, originValue);
+            AXUIElementSetAttributeValue(target, kAXSizeAttribute, sizeValue);
+            AXUIElementSetAttributeValue(target, kAXPositionAttribute, originValue);
+            CFRelease(sizeValue); CFRelease(originValue);
+            AXValueRef current = NULL;
+            CGPoint now = CGPointZero;
+            if (AXUIElementCopyAttributeValue(target, kAXPositionAttribute, (CFTypeRef *)&current) == kAXErrorSuccess && current) {
+                AXValueGetValue(current, kAXValueTypeCGPoint, &now);
+                CFRelease(current);
+            }
+            placed = CGRectContainsPoint(bounds, CGPointMake(now.x + 1, now.y + 1));
+        }
+        CFRelease(target);
+        [self displayCommandRespond:requestID status:placed ? @"adopted" : @"failed"
+            extra:@{@"display":profileInfo, @"leftFullScreen":@(wasFull), @"message":placed ? @"" : @"Window did not move onto the display."}];
+    });
+}
 - (void)displayCommandAwait:(YMManagedDisplay *)profile requestID:(NSString *)requestID running:(BOOL)wantRunning deadline:(NSDate *)deadline {
     BOOL running = profile.display.isCreated && profile.topologyVerified;
     if (wantRunning && running) {
@@ -2801,7 +2866,8 @@ static int YMDisplayCommandUsage(void) {
     fprintf(stderr, "Usage: Yomado --display list\n"
                     "       Yomado --display start --name <name> [--width 1920|2560] [--hidpi 1|0]\n"
                     "       Yomado --display close --name <name>\n"
-                    "       Yomado --display mark --x <x> --y <y>\n");
+                    "       Yomado --display mark --x <x> --y <y>\n"
+                    "       Yomado --display adopt --name <name> --pid <pid> --window <CGWindowID>\n");
     return 64;
 }
 
@@ -2816,7 +2882,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
                 userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
             return 0;
         }
-        if (![@[@"list", @"start", @"close"] containsObject:action]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"start", @"close", @"adopt"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
             if (index + 1 >= argc) return YMDisplayCommandUsage();
@@ -2825,6 +2891,8 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
             if ([key isEqualToString:@"--name"]) message[@"name"] = value;
             else if ([key isEqualToString:@"--width"]) message[@"width"] = @(value.integerValue);
             else if ([key isEqualToString:@"--hidpi"]) message[@"hiDPI"] = @(value.boolValue);
+            else if ([key isEqualToString:@"--pid"]) message[@"pid"] = @(value.intValue);
+            else if ([key isEqualToString:@"--window"]) message[@"window"] = @(value.longLongValue);
             else return YMDisplayCommandUsage();
         }
         if (![action isEqualToString:@"list"] && ![message[@"name"] length]) return YMDisplayCommandUsage();
@@ -2848,7 +2916,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
         NSData *data = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
         printf("%s\n", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding].UTF8String);
         NSString *status = result[@"status"];
-        if ([@[@"ok", @"running", @"closed"] containsObject:status]) return 0;
+        if ([@[@"ok", @"running", @"closed", @"adopted"] containsObject:status]) return 0;
         return [status isEqualToString:@"not-running"] ? 3 : 2;
     }
 }
