@@ -676,6 +676,7 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
     if (self.takeoverDisplayID) [self endTakeover]; else [self beginTakeover];
 }
 - (void)beginTakeover {
+    if (![NSUserDefaults.standardUserDefaults boolForKey:@"YMWorkspacePreviewTakeoverEnabled"]) return;
     if (!self.pipDisplayID || !AXIsProcessTrusted()) return;
     NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
     self.takeoverPreviousApp = front;
@@ -792,6 +793,8 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
         view.onDoubleClick = ^{ [weakSelf togglePiPSize]; };
         view.closeButton.target = self;
         view.closeButton.action = @selector(closePiPFromButton:);
+        // Takeover stays off until it is verified safe (2026-11-10: hand-back and pointer got stuck).
+        view.takeoverButton.hidden = ![NSUserDefaults.standardUserDefaults boolForKey:@"YMWorkspacePreviewTakeoverEnabled"];
         view.takeoverButton.target = self;
         view.takeoverButton.action = @selector(toggleTakeover:);
         view.onForward = ^(NSEvent *event, NSPoint point) { [weakSelf forwardEvent:event atViewPoint:point]; };
