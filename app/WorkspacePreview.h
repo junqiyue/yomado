@@ -28,6 +28,7 @@ NS_ASSUME_NONNULL_BEGIN
 // on a virtual display; type inserts text into the last focused text element.
 - (NSDictionary *)tapAtGlobalPoint:(CGPoint)point secondary:(BOOL)secondary;
 - (NSDictionary *)typeText:(NSString *)text;
+- (NSDictionary *)scrollAtGlobalPoint:(CGPoint)point dx:(double)dx dy:(double)dy;
 @end
 
 NS_ASSUME_NONNULL_END

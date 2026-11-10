@@ -723,9 +723,9 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         // log show --debug --predicate 'subsystem == "dev.chekusu.yomado" AND category == "inventory"'
         for (NSDictionary *blocker in snapshot[@"blockers"]) {
             NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:[blocker[@"pid"] intValue]];
-            os_log_debug(YMInventoryLog(), "blocker %{public}@ %{public}@ window %{public}@", blocker[@"reason"], app.bundleIdentifier ?: @"?", blocker[@"windowID"]);
+            os_log(YMInventoryLog(), "blocker %{public}@ %{public}@ window %{public}@", blocker[@"reason"], app.bundleIdentifier ?: @"?", blocker[@"windowID"]);
         }
-        os_log_debug(YMInventoryLog(), "inventory incomplete: reason=%{public}@ complete=%d", reason, complete);
+        os_log(YMInventoryLog(), "inventory incomplete: reason=%{public}@ complete=%d", reason, complete);
         NSArray *partial = snapshot
             ? [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps]
             : self.windows;

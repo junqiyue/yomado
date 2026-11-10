@@ -2706,6 +2706,11 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
         NSDictionary *result = [self.workspacePreview tapAtGlobalPoint:CGPointMake([info[@"x"] doubleValue], [info[@"y"] doubleValue]) secondary:NO];
         [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":result}]; return;
     }
+    if ([action isEqualToString:@"scroll"]) {
+        NSDictionary *result = [self.workspacePreview scrollAtGlobalPoint:CGPointMake([info[@"x"] doubleValue], [info[@"y"] doubleValue])
+            dx:0 dy:[info[@"dy"] doubleValue]];
+        [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":result}]; return;
+    }
     if ([action isEqualToString:@"type"]) {
         NSString *text = [info[@"text"] isKindOfClass:NSString.class] ? info[@"text"] : @"";
         [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":[self.workspacePreview typeText:text]}]; return;
@@ -2939,7 +2944,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
                 userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
             return 0;
         }
-        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window"] containsObject:action]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window", @"scroll"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
             if (index + 1 >= argc) return YMDisplayCommandUsage();
@@ -2953,9 +2958,10 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
             else if ([key isEqualToString:@"--x"]) message[@"x"] = @(value.doubleValue);
             else if ([key isEqualToString:@"--y"]) message[@"y"] = @(value.doubleValue);
             else if ([key isEqualToString:@"--text"]) message[@"text"] = value;
+            else if ([key isEqualToString:@"--dy"]) message[@"dy"] = @(value.doubleValue);
             else return YMDisplayCommandUsage();
         }
-        if (![@[@"list", @"tap", @"type", @"close-window"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"tap", @"type", @"close-window", @"scroll"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
         NSString *requestID = NSUUID.UUID.UUIDString.lowercaseString;
         message[@"requestID"] = requestID;
         __block NSDictionary *reply = nil;

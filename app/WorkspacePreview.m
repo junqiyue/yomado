@@ -779,6 +779,19 @@ static BOOL YMElementIsText(AXUIElementRef element) {
 
 #include <dlfcn.h>
 typedef AXError (*YMPreviewWindowIDFunction)(AXUIElementRef, CGWindowID *);
+// The top ordinary window at a global point: owner pid and CGWindowID.
+static BOOL YMWindowAtPoint(CGPoint point, pid_t *pid, CGWindowID *windowID) {
+    NSArray *list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    for (NSDictionary *info in list) {
+        if ([info[(id)kCGWindowLayer] integerValue] != 0) continue;
+        CGRect bounds = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &bounds) || !CGRectContainsPoint(bounds, point)) continue;
+        *pid = [info[(id)kCGWindowOwnerPID] intValue];
+        *windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
+        return YES;
+    }
+    return NO;
+}
 // The top ordinary window at a global point, as an accessibility element.
 static AXUIElementRef YMCopyWindowAtPoint(CGPoint point) {
     static YMPreviewWindowIDFunction getWindow;
@@ -831,20 +844,22 @@ static CGRect YMElementFrame(AXUIElementRef element) {
 // of the real control, so search the window's tree for the smallest control
 // whose frame contains the point.
 static NSMutableArray *YMTapTrace;
-static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray *controls) {
+static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray *controls, BOOL prune) {
     YMTapTrace = [NSMutableArray array];
     NSMutableArray *found = [NSMutableArray array];
     NSMutableArray *queue = [NSMutableArray arrayWithObject:(__bridge id)window];
     NSUInteger visited = 0;
-    while (queue.count && visited < 6000) {
+    while (queue.count && visited < (prune ? 6000 : 12000)) {
         id item = queue.firstObject; [queue removeObjectAtIndex:0]; visited++;
         AXUIElementRef element = (__bridge AXUIElementRef)item;
         CGRect frame = YMElementFrame(element);
         BOOL sized = frame.size.width > 0 && frame.size.height > 0;
         NSString *role = YMElementRole(element);
         if (YMTapTrace.count < 80) [YMTapTrace addObject:[NSString stringWithFormat:@"%@ %@ %@", role, NSStringFromRect(NSRectFromCGRect(frame)), sized && !CGRectContainsPoint(frame, point) ? @"x" : @""]];
-        if (sized && !CGRectContainsPoint(frame, point)) continue;
-        if (sized && ([controls containsObject:role] || YMElementIsText(element)))
+        // Web groups can report frames that do not cover their children, so the
+        // second pass walks everything (bounded) instead of pruning.
+        if (prune && sized && !CGRectContainsPoint(frame, point)) continue;
+        if (sized && CGRectContainsPoint(frame, point) && ([controls containsObject:role] || YMElementIsText(element)))
             [found addObject:@{@"element":item, @"area":@(frame.size.width * frame.size.height), @"role":role}];
         CFArrayRef children = NULL;
         if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children) == kAXErrorSuccess && children) {
@@ -915,7 +930,8 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
     NSDictionary *result = nil;
     CFStringRef action = secondary ? kAXShowMenuAction : kAXPressAction;
     AXUIElementRef window = YMCopyWindowAtPoint(target);
-    NSArray *candidates = window ? YMControlsAtPoint(window, target, controls) : @[];
+    NSArray *candidates = window ? YMControlsAtPoint(window, target, controls, YES) : @[];
+    if (window && candidates.firstObject[@"visited"]) candidates = YMControlsAtPoint(window, target, controls, NO);
     CGRect windowFrame = window ? YMElementFrame(window) : CGRectZero;
     if (window) CFRelease(window);
     NSNumber *visitedCount = candidates.firstObject[@"visited"];
@@ -956,28 +972,30 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
     reply[@"window"] = window ? NSStringFromRect(NSRectFromCGRect(windowFrame)) : @"none";
     return reply;
 }
+// Web inputs ignore inserted selected text but accept a whole new value, so
+// edit the value string: append on typing, drop the last character on delete.
+static NSString *YMElementValue(AXUIElementRef element) {
+    CFTypeRef value = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXValueAttribute, &value) != kAXErrorSuccess || !value) return @"";
+    id object = CFBridgingRelease(value);
+    return [object isKindOfClass:NSString.class] ? object : @"";
+}
 - (NSDictionary *)typeText:(NSString *)text {
     id target = self.takeoverTextElement;
     if (!target) return @{@"status":@"no-text-focus"};
-    AXError error = AXUIElementSetAttributeValue((__bridge AXUIElementRef)target, kAXSelectedTextAttribute, (__bridge CFStringRef)text);
-    return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed"};
+    AXUIElementRef element = (__bridge AXUIElementRef)target;
+    NSString *next = [YMElementValue(element) stringByAppendingString:text];
+    AXError error = AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)next);
+    return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed", @"value":YMElementValue(element)};
 }
 - (void)deleteBackward {
-    AXUIElementRef target = (__bridge AXUIElementRef)self.takeoverTextElement;
+    id target = self.takeoverTextElement;
     if (!target) return;
-    AXValueRef rangeValue = NULL;
-    CFRange range = CFRangeMake(0, 0);
-    if (AXUIElementCopyAttributeValue(target, kAXSelectedTextRangeAttribute, (CFTypeRef *)&rangeValue) == kAXErrorSuccess && rangeValue) {
-        AXValueGetValue(rangeValue, kAXValueTypeCFRange, &range);
-        CFRelease(rangeValue);
-    }
-    if (range.length == 0 && range.location > 0) {
-        CFRange previous = CFRangeMake(range.location - 1, 1);
-        AXValueRef selection = AXValueCreate(kAXValueTypeCFRange, &previous);
-        AXUIElementSetAttributeValue(target, kAXSelectedTextRangeAttribute, selection);
-        CFRelease(selection);
-    }
-    AXUIElementSetAttributeValue(target, kAXSelectedTextAttribute, CFSTR(""));
+    AXUIElementRef element = (__bridge AXUIElementRef)target;
+    NSString *current = YMElementValue(element);
+    if (!current.length) return;
+    NSRange last = [current rangeOfComposedCharacterSequenceAtIndex:current.length - 1];
+    AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)[current substringToIndex:last.location]);
 }
 - (void)handleTakeoverKey:(NSEvent *)event {
     if (event.keyCode == 53) { [self endTakeover]; return; }                 // Esc hands back
@@ -995,20 +1013,25 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
     BOOL valid = NO;
     CGPoint target = [self takeoverTargetForViewPoint:point valid:&valid];
     if (!valid) return;
-    AXUIElementRef system = AXUIElementCreateSystemWide();
-    AXUIElementRef hit = NULL;
-    AXUIElementCopyElementAtPosition(system, (float)target.x, (float)target.y, &hit);
-    CFRelease(system);
-    pid_t pid = 0;
-    if (hit) { AXUIElementGetPid(hit, &pid); CFRelease(hit); }
-    if (pid <= 0) return;
     double scale = event.hasPreciseScrollingDeltas ? 1 : 10;
-    CGEventRef wheel = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2,
-        (int32_t)llround(event.scrollingDeltaY * scale), (int32_t)llround(event.scrollingDeltaX * scale), 0);
-    if (!wheel) return;
+    [self scrollAtGlobalPoint:target dx:event.scrollingDeltaX * scale dy:event.scrollingDeltaY * scale];
+}
+// Scroll the window under a virtual-display point without moving the pointer:
+// the wheel event goes to that app only and names the window it is for.
+- (NSDictionary *)scrollAtGlobalPoint:(CGPoint)target dx:(double)dx dy:(double)dy {
+    BOOL onVirtual = NO;
+    for (NSDictionary *display in self.displays)
+        if (CGRectContainsPoint(CGDisplayBounds([display[@"displayID"] unsignedIntValue]), target)) onVirtual = YES;
+    pid_t pid = 0; CGWindowID windowID = 0;
+    if (!onVirtual || !YMWindowAtPoint(target, &pid, &windowID)) return @{@"status":@"miss"};
+    CGEventRef wheel = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2, (int32_t)llround(dy), (int32_t)llround(dx), 0);
+    if (!wheel) return @{@"status":@"failed"};
     CGEventSetLocation(wheel, target);
-    CGEventPostToPid(pid, wheel);   // to that app only; the pointer does not move
+    CGEventSetIntegerValueField(wheel, kCGMouseEventWindowUnderMousePointer, windowID);
+    CGEventSetIntegerValueField(wheel, kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent, windowID);
+    CGEventPostToPid(pid, wheel);
     CFRelease(wheel);
+    return @{@"status":@"scrolled", @"window":@(windowID)};
 }
 
 #pragma mark Picture in picture
@@ -1075,6 +1098,7 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(pipFrameChanged:) name:NSWindowDidMoveNotification object:panel];
     }
     self.pipDisplayID = ident;
+    self.pipView.takeoverAvailable = YMTakeoverEnabled();
     self.pipView.title.stringValue = [self nameForDisplayID:ident];
     YMSetContents(self.pipView.picture, nil);
     YMPreviewSource *source = self.sources[ident];
