@@ -1,4 +1,6 @@
 #import "AppWorkspace.h"
+#import <os/log.h>
+static os_log_t YMInventoryLog(void) { static os_log_t log; static dispatch_once_t once; dispatch_once(&once, ^{ log = os_log_create("dev.chekusu.yomado", "inventory"); }); return log; }
 #import "AppWorkspaceAccess.h"
 #import "AppWorkspacePolicy.h"
 #import <CoreGraphics/CoreGraphics.h>
@@ -717,6 +719,13 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     if (!complete || !snapshot || ![snapshot[@"complete"] boolValue] ||
         [self cgHasUnclassifiableEvidence:liveCG] ||
         [self snapshotHasUnresolvedEvidence:movableSnapshot cg:liveCG excludedKeys:classifiedKeys]) {
+        // Debug-level trail of what kept the inventory from verifying; view with
+        // log show --debug --predicate 'subsystem == "dev.chekusu.yomado" AND category == "inventory"'
+        for (NSDictionary *blocker in snapshot[@"blockers"]) {
+            NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:[blocker[@"pid"] intValue]];
+            os_log_debug(YMInventoryLog(), "blocker %{public}@ %{public}@ window %{public}@", blocker[@"reason"], app.bundleIdentifier ?: @"?", blocker[@"windowID"]);
+        }
+        os_log_debug(YMInventoryLog(), "inventory incomplete: reason=%{public}@ complete=%d", reason, complete);
         NSArray *partial = snapshot
             ? [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps]
             : self.windows;

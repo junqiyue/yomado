@@ -27,6 +27,66 @@ static void YMSetContents(CALayer *layer, id contents) {
     [CATransaction commit];
 }
 
+
+// Where a display's picture actually sits inside an aspect-fit layer.
+static CGRect YMAspectFitRect(CGSize content, CGRect bounds) {
+    if (content.width <= 0 || content.height <= 0 || bounds.size.width <= 0 || bounds.size.height <= 0) return bounds;
+    CGFloat scale = MIN(bounds.size.width / content.width, bounds.size.height / content.height);
+    CGSize size = CGSizeMake(content.width * scale, content.height * scale);
+    return CGRectMake(CGRectGetMidX(bounds) - size.width / 2, CGRectGetMidY(bounds) - size.height / 2, size.width, size.height);
+}
+static void YMAddRipple(CALayer *host, CGPoint at, CGFloat radius) {
+    if (!host) return;
+    CAShapeLayer *ring = [CAShapeLayer layer];
+    CGPathRef path = CGPathCreateWithEllipseInRect(CGRectMake(-radius, -radius, radius * 2, radius * 2), NULL);
+    ring.path = path;
+    CGPathRelease(path);
+    ring.position = at;
+    ring.fillColor = [NSColor colorWithSRGBRed:0.898 green:0.282 blue:0.302 alpha:0.22].CGColor;
+    ring.strokeColor = [NSColor colorWithSRGBRed:0.898 green:0.282 blue:0.302 alpha:1].CGColor;
+    ring.lineWidth = MAX(2.5, radius / 4);
+    ring.shadowColor = NSColor.whiteColor.CGColor;
+    ring.shadowOpacity = 0.9;
+    ring.shadowRadius = 1.5;
+    ring.shadowOffset = CGSizeZero;
+    [host addSublayer:ring];
+    CAShapeLayer *dot = [CAShapeLayer layer];
+    CGFloat dr = MAX(3, radius / 3.5);
+    CGPathRef dotPath = CGPathCreateWithEllipseInRect(CGRectMake(-dr, -dr, dr * 2, dr * 2), NULL);
+    dot.path = dotPath;
+    CGPathRelease(dotPath);
+    dot.position = at;
+    dot.fillColor = [NSColor colorWithSRGBRed:0.898 green:0.282 blue:0.302 alpha:1].CGColor;
+    dot.strokeColor = NSColor.whiteColor.CGColor;
+    dot.lineWidth = MAX(1, dr / 3);
+    [host addSublayer:dot];
+    CABasicAnimation *dotFade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    dotFade.fromValue = @1; dotFade.toValue = @0; dotFade.beginTime = CACurrentMediaTime() + 0.8; dotFade.duration = 0.5;
+    dotFade.fillMode = kCAFillModeBackwards; dotFade.removedOnCompletion = NO;
+    dot.opacity = 0;
+    [dot addAnimation:dotFade forKey:@"fade"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [dot removeFromSuperlayer]; });
+    CAMediaTimingFunction *ease = [CAMediaTimingFunction functionWithControlPoints:0.2 :0.9 :0.25 :1];
+    CABasicAnimation *grow = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    grow.fromValue = @(YMReduceMotion() ? 1.0 : 0.35);
+    grow.toValue = @(YMReduceMotion() ? 1.0 : 1.5);
+    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    fade.fromValue = @1;
+    fade.toValue = @0;
+    fade.beginTime = 0.6;
+    fade.duration = 0.6;
+    CAAnimationGroup *group = [CAAnimationGroup animation];
+    group.animations = @[grow, fade];
+    group.duration = 1.2;
+    group.timingFunction = ease;
+    group.fillMode = kCAFillModeForwards;
+    group.removedOnCompletion = NO;
+    [CATransaction begin];
+    [CATransaction setCompletionBlock:^{ [ring removeFromSuperlayer]; }];
+    [ring addAnimation:group forKey:@"ripple"];
+    [CATransaction commit];
+}
+
 #pragma mark - Capture source (one ScreenCaptureKit stream per virtual display)
 
 @interface YMPreviewSource : NSObject <SCStreamOutput, SCStreamDelegate>
@@ -532,6 +592,29 @@ static void YMConfigureFloatingPanel(NSPanel *panel) {
 - (void)requestPermission {
     CGRequestScreenCaptureAccess();
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]];
+}
+
+#pragma mark Agent action marks
+
+- (void)markPoint:(CGPoint)point {
+    if (!self.enabled) return;
+    for (NSUInteger index = 0; index < self.displays.count; index++) {
+        NSNumber *ident = self.displays[index][@"displayID"];
+        CGRect bounds = CGDisplayBounds(ident.unsignedIntValue);
+        if (!CGRectContainsPoint(bounds, point)) continue;
+        // Normalized position, origin bottom-left to match AppKit layers.
+        CGFloat nx = (point.x - bounds.origin.x) / bounds.size.width;
+        CGFloat ny = 1 - (point.y - bounds.origin.y) / bounds.size.height;
+        NSMutableArray<CALayer *> *hosts = [NSMutableArray array];
+        if (index < self.cards.count) [hosts addObject:self.cards[index].picture];
+        if ([self.pipDisplayID isEqual:ident] && self.pip.visible) [hosts addObject:self.pipView.picture];
+        for (CALayer *host in hosts) {
+            CGRect fit = YMAspectFitRect(bounds.size, host.bounds);
+            CGPoint at = CGPointMake(CGRectGetMinX(fit) + nx * fit.size.width, CGRectGetMinY(fit) + ny * fit.size.height);
+            YMAddRipple(host, at, MAX(7, fit.size.width / 60));
+        }
+        return;
+    }
 }
 
 #pragma mark Picture in picture

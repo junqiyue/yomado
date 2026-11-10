@@ -17,6 +17,9 @@ NS_ASSUME_NONNULL_BEGIN
 // displays: @[@{@"displayID": @(CGDirectDisplayID), @"name": NSString}], in display order.
 - (void)updateDisplays:(NSArray<NSDictionary *> *)displays;
 - (void)invalidate;
+// Show a short ripple where an agent just acted. point is in global desktop
+// coordinates (origin top-left of the main display, as CGDisplayBounds).
+- (void)markPoint:(CGPoint)point;
 @end
 
 NS_ASSUME_NONNULL_END

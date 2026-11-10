@@ -2635,6 +2635,7 @@ static int PreviewUI(NSString *path, NSString *state, BOOL dark) {
 // window recovery on close. Moving windows stays with the agent's own tools.
 static NSString *const YMDisplayCommandRequestName = @"dev.chekusu.yomado.display.request";
 static NSString *const YMDisplayCommandResponseName = @"dev.chekusu.yomado.display.response";
+static NSString *const YMDisplayMarkName = @"dev.chekusu.yomado.display.mark";
 static NSString *const YMDisplayCommandObject = @"dev.chekusu.yomado";
 static NSString *const YMDisplayCommandsEnabledKey = @"YMDisplayCommandsEnabled";
 static const NSTimeInterval YMDisplayCommandSeconds = 45;
@@ -2644,6 +2645,18 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(displayCommandReceived:)
         name:YMDisplayCommandRequestName object:YMDisplayCommandObject
         suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(displayMarkReceived:)
+        name:YMDisplayMarkName object:YMDisplayCommandObject
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+}
+// An agent reports where it just acted so the person can follow along in the preview.
+- (void)displayMarkReceived:(NSNotification *)note {
+    if (![NSUserDefaults.standardUserDefaults boolForKey:YMDisplayCommandsEnabledKey]) return;
+    NSDictionary *info = [note.userInfo isKindOfClass:NSDictionary.class] ? note.userInfo : @{};
+    if (![info[@"x"] isKindOfClass:NSNumber.class] || ![info[@"y"] isKindOfClass:NSNumber.class]) return;
+    double x = [info[@"x"] doubleValue], y = [info[@"y"] doubleValue];
+    if (!isfinite(x) || !isfinite(y)) return;
+    [self.workspacePreview markPoint:CGPointMake(x, y)];
 }
 - (void)displayCommandRespond:(NSString *)requestID status:(NSString *)status extra:(NSDictionary *)extra {
     NSMutableDictionary *info = [extra ?: @{} mutableCopy];
@@ -2765,7 +2778,7 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
         [self displayCommandRespond:requestID status:@"running" extra:@{@"display":[self displayCommandInfoForProfile:profile]}];
         return;
     }
-    if (!wantRunning && !profile.display.isCreated) {
+    if (!wantRunning && !profile.display.isCreated && !self.displayOperationInProgress) {
         [self displayCommandRespond:requestID status:@"closed" extra:@{@"display":[self displayCommandInfoForProfile:profile]}];
         return;
     }
@@ -2787,7 +2800,8 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
 static int YMDisplayCommandUsage(void) {
     fprintf(stderr, "Usage: Yomado --display list\n"
                     "       Yomado --display start --name <name> [--width 1920|2560] [--hidpi 1|0]\n"
-                    "       Yomado --display close --name <name>\n");
+                    "       Yomado --display close --name <name>\n"
+                    "       Yomado --display mark --x <x> --y <y>\n");
     return 64;
 }
 
@@ -2795,6 +2809,13 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc < 3) return YMDisplayCommandUsage();
         NSString *action = [NSString stringWithUTF8String:argv[2]];
+        if ([action isEqualToString:@"mark"]) {
+            // One-way: Yomado --display mark --x <x> --y <y>   (global desktop points, origin top-left)
+            if (argc != 7 || strcmp(argv[3], "--x") || strcmp(argv[5], "--y")) return YMDisplayCommandUsage();
+            [NSDistributedNotificationCenter.defaultCenter postNotificationName:YMDisplayMarkName object:YMDisplayCommandObject
+                userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
+            return 0;
+        }
         if (![@[@"list", @"start", @"close"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
