@@ -2870,21 +2870,13 @@ static AXUIElementRef YMCopyAXWindow(pid_t pid, CGWindowID windowID) {
     if (pid <= 0 || !windowID || !AXIsProcessTrusted()) {
         [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Need --pid, --window and Accessibility access."}]; return;
     }
-    static YMWindowIDFunction getWindow;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ getWindow = (YMWindowIDFunction)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
-    AXUIElementRef app = AXUIElementCreateApplication(pid);
-    CFArrayRef windows = NULL;
-    AXUIElementRef target = NULL;
-    if (app && getWindow && AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
-        for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
-            AXUIElementRef element = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
-            CGWindowID candidate = 0;
-            if (getWindow(element, &candidate) == kAXErrorSuccess && candidate == windowID) { target = (AXUIElementRef)CFRetain(element); break; }
-        }
+    // A window the app has just created reaches WindowServer before the app's
+    // accessibility list; wait up to 3 s for it to appear (seen with Chrome).
+    __block AXUIElementRef target = NULL;
+    for (int attempt = 0; attempt < 12 && !target; attempt++) {
+        target = YMCopyAXWindow(pid, windowID);
+        if (!target) [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
     }
-    if (windows) CFRelease(windows);
-    if (app) CFRelease(app);
     if (!target) { [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"Window not found for that process."}]; return; }
     CFBooleanRef fullScreen = NULL;
     BOOL wasFull = AXUIElementCopyAttributeValue(target, CFSTR("AXFullScreen"), (CFTypeRef *)&fullScreen) == kAXErrorSuccess
