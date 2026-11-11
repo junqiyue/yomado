@@ -179,6 +179,8 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMAppWorkspace *appWorkspace;
 @property YMInputLeaseCenter *inputLeases;
 @property YMWorkspacePreview *workspacePreview;
+@property(nonatomic) NSSet<NSNumber *> *virtualWindowIDs; // windows seen on virtual displays at the last check
+@property(nonatomic) NSTimer *virtualWindowTimer;
 @property BOOL displayCommandHeadless; // a --display request is running: report failures in its reply, never in a dialog
 @property NSStackView *applicationCards;
 @property NSView *permissionContainer;
@@ -253,6 +255,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @end
 @interface ADController (YMDisplayCommands)
 - (void)startDisplayCommands;
+- (void)checkVirtualWindowArrivals;
 @end
 
 static OSStatus RecoveryHotkey(EventHandlerCallRef next, EventRef event, void *data) {
@@ -484,6 +487,13 @@ static os_log_t YMQuitLog(void) {
     self.inputLeases = [[YMInputLeaseCenter alloc] init];
     [self.inputLeases start];
     [self startDisplayCommands];
+    // When a window arrives on a virtual display (dragged by the person or
+    // adopted by an agent), hand "last active" back to that app's window on a
+    // physical display so new documents don't open on a screen nobody sees.
+    if (![NSUserDefaults.standardUserDefaults objectForKey:@"YMPreferPhysicalWindows"] || [NSUserDefaults.standardUserDefaults boolForKey:@"YMPreferPhysicalWindows"]) {
+        __weak ADController *weakSelf = self;
+        self.virtualWindowTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; [weakSelf checkVirtualWindowArrivals]; }];
+    }
     self.workspacePreview = [[YMWorkspacePreview alloc] init];
     EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
     OSStatus handlerStatus = InstallEventHandler(GetApplicationEventTarget(), RecoveryHotkey, 1, &type,
@@ -2358,6 +2368,7 @@ static os_log_t YMQuitLog(void) {
     [self.panelPresenter invalidate];
     [self.inputLeases stop];
     [self.workspacePreview invalidate];
+    [self.virtualWindowTimer invalidate];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.heartbeatTimer invalidate];
     if (self.hotkey) UnregisterEventHotKey(self.hotkey);
@@ -2699,6 +2710,7 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
     NSString *name = [info[@"name"] isKindOfClass:NSString.class] ? info[@"name"] : @"";
     if ([action isEqualToString:@"adopt"]) { [self displayCommandAdopt:info requestID:requestID]; return; }
     if ([action isEqualToString:@"close-window"]) { [self displayCommandCloseWindow:info requestID:requestID]; return; }
+    if ([action isEqualToString:@"prefer-physical"]) { [self displayCommandPreferPhysical:info requestID:requestID]; return; }
     if ([action isEqualToString:@"tap"]) {
         if (![info[@"x"] isKindOfClass:NSNumber.class] || ![info[@"y"] isKindOfClass:NSNumber.class]) {
             [self displayCommandRespond:requestID status:@"failed" extra:@{@"message":@"--x and --y are required."}]; return;
@@ -2859,6 +2871,68 @@ static AXUIElementRef YMCopyAXWindow(pid_t pid, CGWindowID windowID) {
         [self displayCommandRespond:requestID status:closed ? @"closed" : @"failed" extra:@{@"leftFullScreen":@(wasFull)}];
     });
 }
+// Apps open new documents in their last active window (Chrome: `open x.html`
+// becomes a tab there). When that window is on a virtual display, the person's
+// next document disappears onto a screen they can't see. Make the app's front
+// window on a physical display its main window again, without activating it.
+- (void)checkVirtualWindowArrivals {
+    BOOL anyVirtual = NO;
+    for (YMManagedDisplay *profile in [self activeProfiles]) if (profile.display.isCreated) anyVirtual = YES;
+    if (!anyVirtual) { self.virtualWindowIDs = nil; return; }
+    if (NSEvent.pressedMouseButtons) return; // mid-drag: decide after the drop
+    NSArray *list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    NSMutableSet *now = [NSMutableSet set];
+    NSMutableSet *arrivedPIDs = [NSMutableSet set];
+    for (NSDictionary *window in list) {
+        if ([window[(id)kCGWindowLayer] intValue] != 0) continue;
+        pid_t pid = [window[(id)kCGWindowOwnerPID] intValue];
+        if (pid == getpid()) continue;
+        CGRect bounds = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)window[(id)kCGWindowBounds], &bounds) || bounds.size.height < 200) continue;
+        CGDirectDisplayID displays[4]; uint32_t count = 0;
+        CGGetDisplaysWithPoint(CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds)), 4, displays, &count);
+        if (count == 0 || ![VDVirtualDisplay isVirtualDisplay:displays[0]]) continue;
+        NSNumber *ident = window[(id)kCGWindowNumber];
+        [now addObject:ident];
+        if (self.virtualWindowIDs && ![self.virtualWindowIDs containsObject:ident]) [arrivedPIDs addObject:@(pid)];
+    }
+    self.virtualWindowIDs = now;
+    for (NSNumber *pid in arrivedPIDs) [self preferPhysicalWindowForPID:pid.intValue];
+}
+- (NSDictionary *)preferPhysicalWindowForPID:(pid_t)pid {
+    if (pid <= 0 || !AXIsProcessTrusted()) return @{@"status":@"failed", @"message":@"Need --pid and Accessibility access."};
+    NSArray *list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    for (NSDictionary *window in list) {
+        if ([window[(id)kCGWindowOwnerPID] intValue] != pid || [window[(id)kCGWindowLayer] intValue] != 0) continue;
+        CGRect bounds = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)window[(id)kCGWindowBounds], &bounds) || bounds.size.height < 200) continue;
+        CGDirectDisplayID displays[4]; uint32_t count = 0;
+        CGGetDisplaysWithPoint(CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds)), 4, displays, &count);
+        if (count == 0 || [VDVirtualDisplay isVirtualDisplay:displays[0]]) continue;
+        CGWindowID windowID = [window[(id)kCGWindowNumber] unsignedIntValue];
+        AXUIElementRef target = YMCopyAXWindow(pid, windowID);
+        if (!target) continue;
+        AXError result = AXUIElementSetAttributeValue(target, kAXMainAttribute, kCFBooleanTrue);
+        CFRelease(target);
+        return @{@"status":result == kAXErrorSuccess ? @"ok" : @"failed", @"window":@(windowID), @"axError":@(result)};
+    }
+    return @{@"status":@"none", @"message":@"No window of that process on a physical display."};
+}
+- (void)displayCommandPreferPhysical:(NSDictionary *)info requestID:(NSString *)requestID {
+    pid_t pid = [info[@"pid"] intValue];
+    CGWindowID only = [info[@"window"] unsignedIntValue];
+    if (only) { // test hook: make one exact window main
+        AXUIElementRef target = YMCopyAXWindow(pid, only);
+        AXError error = target ? AXUIElementSetAttributeValue(target, kAXMainAttribute, kCFBooleanTrue) : kAXErrorInvalidUIElement;
+        if (target) CFRelease(target);
+        [self displayCommandRespond:requestID status:error == kAXErrorSuccess ? @"ok" : @"failed" extra:@{@"window":@(only), @"axError":@(error)}];
+        return;
+    }
+    NSMutableDictionary *result = [[self preferPhysicalWindowForPID:pid] mutableCopy];
+    NSString *status = result[@"status"];
+    [result removeObjectForKey:@"status"];
+    [self displayCommandRespond:requestID status:status extra:result];
+}
 - (void)displayCommandAdopt:(NSDictionary *)info requestID:(NSString *)requestID {
     NSString *name = [info[@"name"] isKindOfClass:NSString.class] ? info[@"name"] : @"";
     pid_t pid = [info[@"pid"] intValue];
@@ -2961,7 +3035,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
                 userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
             return 0;
         }
-        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window", @"scroll", @"fence-test"] containsObject:action]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window", @"scroll", @"fence-test", @"prefer-physical"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
             if (index + 1 >= argc) return YMDisplayCommandUsage();
@@ -2978,7 +3052,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
             else if ([key isEqualToString:@"--dy"]) message[@"dy"] = @(value.doubleValue);
             else return YMDisplayCommandUsage();
         }
-        if (![@[@"list", @"tap", @"type", @"close-window", @"scroll", @"fence-test"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"tap", @"type", @"close-window", @"scroll", @"fence-test", @"prefer-physical"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
         NSString *requestID = NSUUID.UUID.UUIDString.lowercaseString;
         message[@"requestID"] = requestID;
         __block NSDictionary *reply = nil;
