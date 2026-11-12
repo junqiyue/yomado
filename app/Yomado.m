@@ -2901,6 +2901,49 @@ static AXUIElementRef YMCopyAXWindow(pid_t pid, CGWindowID windowID) {
     }
     self.virtualWindowIDs = now;
     for (NSNumber *pid in arrivedPIDs) [self preferPhysicalWindowForPID:pid.intValue];
+    [self rescueFocusedWindowFromVirtualDisplay];
+}
+// The window the person is using must never be on a screen they can't see.
+// Agents work in the background and never activate apps, so if the front app's
+// focused window sits on a virtual display, the person just switched to it
+// (Dock, Command-Tab, `open`, a notification): bring it to the physical
+// display under the pointer, keeping its size.
+- (void)rescueFocusedWindowFromVirtualDisplay {
+    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (!front || front.processIdentifier == getpid() || !AXIsProcessTrusted()) return;
+    AXUIElementRef app = AXUIElementCreateApplication(front.processIdentifier);
+    AXUIElementRef window = NULL;
+    AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, (CFTypeRef *)&window);
+    CFRelease(app);
+    if (!window) return;
+    CGPoint origin = CGPointZero; CGSize size = CGSizeZero;
+    AXValueRef value = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXPositionAttribute, (CFTypeRef *)&value) == kAXErrorSuccess && value) { AXValueGetValue(value, kAXValueTypeCGPoint, &origin); CFRelease(value); }
+    value = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXSizeAttribute, (CFTypeRef *)&value) == kAXErrorSuccess && value) { AXValueGetValue(value, kAXValueTypeCGSize, &size); CFRelease(value); }
+    CGDirectDisplayID displays[4]; uint32_t count = 0;
+    CGGetDisplaysWithPoint(CGPointMake(origin.x + size.width / 2, origin.y + size.height / 2), 4, displays, &count);
+    if (count == 0 || ![VDVirtualDisplay isVirtualDisplay:displays[0]]) { CFRelease(window); return; }
+    CGEventRef now = CGEventCreate(NULL);
+    CGPoint pointer = now ? CGEventGetLocation(now) : CGPointZero;
+    if (now) CFRelease(now);
+    CGDirectDisplayID target = CGMainDisplayID();
+    count = 0;
+    if (CGGetDisplaysWithPoint(pointer, 4, displays, &count) == kCGErrorSuccess && count && ![VDVirtualDisplay isVirtualDisplay:displays[0]]) target = displays[0];
+    CGRect bounds = CGDisplayBounds(target);
+    CGSize fit = CGSizeMake(MIN(size.width, bounds.size.width - 40), MIN(size.height, bounds.size.height - 80));
+    CGPoint place = CGPointMake(CGRectGetMidX(bounds) - fit.width / 2, MAX(CGRectGetMinY(bounds) + 40, CGRectGetMidY(bounds) - fit.height / 2));
+    for (int attempt = 0; attempt < 3; attempt++) { // the first cross-display move is often clamped back
+        AXValueRef position = AXValueCreate(kAXValueTypeCGPoint, &place);
+        AXUIElementSetAttributeValue(window, kAXPositionAttribute, position);
+        CFRelease(position);
+        if (!CGSizeEqualToSize(fit, size)) { AXValueRef sized = AXValueCreate(kAXValueTypeCGSize, &fit); AXUIElementSetAttributeValue(window, kAXSizeAttribute, sized); CFRelease(sized); }
+        value = NULL; CGPoint landed = CGPointZero;
+        if (AXUIElementCopyAttributeValue(window, kAXPositionAttribute, (CFTypeRef *)&value) == kAXErrorSuccess && value) { AXValueGetValue(value, kAXValueTypeCGPoint, &landed); CFRelease(value); }
+        if (CGRectContainsPoint(bounds, landed)) break;
+    }
+    os_log(OS_LOG_DEFAULT, "yomado: brought %{public}@'s focused window back from a virtual display", front.localizedName ?: @"?");
+    CFRelease(window);
 }
 - (NSDictionary *)preferPhysicalWindowForPID:(pid_t)pid {
     if (pid <= 0 || !AXIsProcessTrusted()) return @{@"status":@"failed", @"message":@"Need --pid and Accessibility access."};
