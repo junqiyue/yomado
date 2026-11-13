@@ -2886,6 +2886,7 @@ static AXUIElementRef YMCopyAXWindow(pid_t pid, CGWindowID windowID) {
     NSArray *list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
     NSMutableSet *now = [NSMutableSet set];
     NSMutableSet *arrivedPIDs = [NSMutableSet set];
+    NSMutableSet *virtualPIDs = [NSMutableSet set];
     for (NSDictionary *window in list) {
         if ([window[(id)kCGWindowLayer] intValue] != 0) continue;
         pid_t pid = [window[(id)kCGWindowOwnerPID] intValue];
@@ -2897,11 +2898,37 @@ static AXUIElementRef YMCopyAXWindow(pid_t pid, CGWindowID windowID) {
         if (count == 0 || ![VDVirtualDisplay isVirtualDisplay:displays[0]]) continue;
         NSNumber *ident = window[(id)kCGWindowNumber];
         [now addObject:ident];
+        [virtualPIDs addObject:@(pid)];
         if (self.virtualWindowIDs && ![self.virtualWindowIDs containsObject:ident]) [arrivedPIDs addObject:@(pid)];
     }
     self.virtualWindowIDs = now;
+    // A window that was already there can still become the app's main one later
+    // (a display was unplugged, a click landed in it). Check the main window of
+    // every background app that owns a virtual window, except during takeover,
+    // when the person is typing into that window on purpose.
+    pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    if (!self.workspacePreview.takeoverDisplayID)
+        for (NSNumber *pid in virtualPIDs)
+            if (pid.intValue != frontPID && ![arrivedPIDs containsObject:pid] && YMMainWindowIsOnVirtualDisplay(pid.intValue)) [arrivedPIDs addObject:pid];
     for (NSNumber *pid in arrivedPIDs) [self preferPhysicalWindowForPID:pid.intValue];
     [self rescueFocusedWindowFromVirtualDisplay];
+}
+static BOOL YMMainWindowIsOnVirtualDisplay(pid_t pid) {
+    if (!AXIsProcessTrusted()) return NO;
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    AXUIElementRef window = NULL;
+    AXUIElementCopyAttributeValue(app, kAXMainWindowAttribute, (CFTypeRef *)&window);
+    CFRelease(app);
+    if (!window) return NO;
+    CGPoint origin = CGPointZero; CGSize size = CGSizeZero;
+    AXValueRef value = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXPositionAttribute, (CFTypeRef *)&value) == kAXErrorSuccess && value) { AXValueGetValue(value, kAXValueTypeCGPoint, &origin); CFRelease(value); }
+    value = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXSizeAttribute, (CFTypeRef *)&value) == kAXErrorSuccess && value) { AXValueGetValue(value, kAXValueTypeCGSize, &size); CFRelease(value); }
+    CFRelease(window);
+    CGDirectDisplayID displays[4]; uint32_t count = 0;
+    CGGetDisplaysWithPoint(CGPointMake(origin.x + size.width / 2, origin.y + size.height / 2), 4, displays, &count);
+    return count > 0 && [VDVirtualDisplay isVirtualDisplay:displays[0]];
 }
 // The window the person is using must never be on a screen they can't see.
 // Agents work in the background and never activate apps, so if the front app's
