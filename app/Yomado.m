@@ -181,6 +181,8 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMWorkspacePreview *workspacePreview;
 @property(nonatomic) NSSet<NSNumber *> *virtualWindowIDs; // windows seen on virtual displays at the last check
 @property(nonatomic) NSTimer *virtualWindowTimer;
+@property(nonatomic) pid_t activatedPID;          // app the person just switched to
+@property(nonatomic) NSTimeInterval activatedAt;  // when, for the focused-window rescue
 @property BOOL displayCommandHeadless; // a --display request is running: report failures in its reply, never in a dialog
 @property NSStackView *applicationCards;
 @property NSView *permissionContainer;
@@ -493,6 +495,11 @@ static os_log_t YMQuitLog(void) {
     if (![NSUserDefaults.standardUserDefaults objectForKey:@"YMPreferPhysicalWindows"] || [NSUserDefaults.standardUserDefaults boolForKey:@"YMPreferPhysicalWindows"]) {
         __weak ADController *weakSelf = self;
         self.virtualWindowTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; [weakSelf checkVirtualWindowArrivals]; }];
+        [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceDidActivateApplicationNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
+            weakSelf.activatedPID = app.processIdentifier;
+            weakSelf.activatedAt = NSDate.timeIntervalSinceReferenceDate;
+        }];
     }
     self.workspacePreview = [[YMWorkspacePreview alloc] init];
     EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
@@ -2931,13 +2938,17 @@ static BOOL YMMainWindowIsOnVirtualDisplay(pid_t pid) {
     return count > 0 && [VDVirtualDisplay isVirtualDisplay:displays[0]];
 }
 // The window the person is using must never be on a screen they can't see.
-// Agents work in the background and never activate apps, so if the front app's
-// focused window sits on a virtual display, the person just switched to it
-// (Dock, Command-Tab, `open`, a notification): bring it to the physical
-// display under the pointer, keeping its size.
+// When the person switches to an app (Dock, Command-Tab, `open`, a
+// notification) and its focused window sits on a virtual display, bring it to
+// the physical display under the pointer, keeping its size. Only right after
+// such a switch: focus also moves inside an app that is already in front, when
+// the person types into a virtual window through takeover or an agent focuses
+// a field there, and those windows must stay where they are.
 - (void)rescueFocusedWindowFromVirtualDisplay {
     NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
     if (!front || front.processIdentifier == getpid() || !AXIsProcessTrusted()) return;
+    if (front.processIdentifier != self.activatedPID || NSDate.timeIntervalSinceReferenceDate - self.activatedAt > 2) return;
+    if (self.workspacePreview.takeoverDisplayID) return;
     AXUIElementRef app = AXUIElementCreateApplication(front.processIdentifier);
     AXUIElementRef window = NULL;
     AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, (CFTypeRef *)&window);
