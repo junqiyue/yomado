@@ -910,33 +910,38 @@ static BOOL YMWindowAtPoint(CGPoint point, pid_t *pid, CGWindowID *windowID) {
     return NO;
 }
 // The top ordinary window at a global point, as an accessibility element.
-static AXUIElementRef YMCopyWindowAtPoint(CGPoint point) {
+// Windows under a point, top first, as long as they belong to the topmost
+// window's app: an app's own overlay (Chrome's address-bar suggestions cover
+// the address bar) must not hide the window beneath it.
+static NSArray *YMWindowsAtPoint(CGPoint point) {
     static YMPreviewWindowIDFunction getWindow;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ getWindow = (YMPreviewWindowIDFunction)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
-    if (!getWindow) return NULL;
+    NSMutableArray *result = [NSMutableArray array];
+    if (!getWindow) return result;
     NSArray *list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    pid_t owner = 0;
     for (NSDictionary *info in list) {
         if ([info[(id)kCGWindowLayer] integerValue] != 0) continue;
         CGRect bounds = CGRectZero;
         if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &bounds) || !CGRectContainsPoint(bounds, point)) continue;
         pid_t pid = [info[(id)kCGWindowOwnerPID] intValue];
+        if (owner && pid != owner) break;
+        owner = pid;
         CGWindowID windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
         AXUIElementRef app = AXUIElementCreateApplication(pid);
         CFArrayRef windows = NULL;
-        AXUIElementRef found = NULL;
         if (app && AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
             for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
                 AXUIElementRef element = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
                 CGWindowID candidate = 0;
-                if (getWindow(element, &candidate) == kAXErrorSuccess && candidate == windowID) { found = (AXUIElementRef)CFRetain(element); break; }
+                if (getWindow(element, &candidate) == kAXErrorSuccess && candidate == windowID) { [result addObject:(__bridge id)element]; break; }
             }
         }
         if (windows) CFRelease(windows);
         if (app) CFRelease(app);
-        return found;   // the topmost window wins, found or not
     }
-    return NULL;
+    return result;
 }
 
 static CGRect YMElementFrame(AXUIElementRef element) {
@@ -1013,6 +1018,34 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
     return CGPointMake(bounds.origin.x + nx * bounds.size.width, bounds.origin.y + ny * bounds.size.height);
 }
 // Shared with --display tap so the same path can be exercised without a mouse.
+static void YMSetSelectedRange(AXUIElementRef element, NSRange range);
+static NSString *YMElementValue(AXUIElementRef element);
+static BOOL YMElementInPage(AXUIElementRef field) {
+    BOOL inPage = NO;
+    AXUIElementRef element = (AXUIElementRef)CFRetain(field);
+    for (int depth = 0; depth < 40 && element && !inPage; depth++) {
+        if ([YMElementRole(element) isEqualToString:@"AXWebArea"]) inPage = YES;
+        AXUIElementRef parent = NULL;
+        AXUIElementCopyAttributeValue(element, kAXParentAttribute, (CFTypeRef *)&parent);
+        CFRelease(element);
+        element = parent;
+    }
+    if (element) CFRelease(element);
+    return inPage;
+}
+// Focusing a browser's own field (address bar, find bar) through accessibility
+// leaves the caret at the start; a click selects everything, so do that. The
+// field settles its selection right after taking focus, so select again.
+static void YMSelectAllInBrowserField(AXUIElementRef field) {
+    if (YMElementInPage(field)) return;
+    NSString *focused = YMElementValue(field);
+    YMSetSelectedRange(field, NSMakeRange(0, focused.length));
+    CFRetain(field);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if ([YMElementValue(field) isEqualToString:focused]) YMSetSelectedRange(field, NSMakeRange(0, focused.length)); // not once typing started
+        CFRelease(field);
+    });
+}
 - (NSDictionary *)tapAtGlobalPoint:(CGPoint)target secondary:(BOOL)secondary {
     AXUIElementRef system = AXUIElementCreateSystemWide();
     AXUIElementRef hit = NULL;
@@ -1042,14 +1075,21 @@ static NSArray *YMControlsAtPoint(AXUIElementRef window, CGPoint point, NSArray 
                           @"AXPopUpButton", @"AXTab", @"AXDisclosureTriangle", @"AXCell", @"AXRow"];
     NSDictionary *result = nil;
     CFStringRef action = secondary ? kAXShowMenuAction : kAXPressAction;
-    AXUIElementRef window = YMCopyWindowAtPoint(target);
-    NSArray *candidates = window ? YMControlsAtPoint(window, target, controls, YES) : @[];
-    if (window && !candidates.count) candidates = YMControlsAtPoint(window, target, controls, NO);
-    if (window) CFRelease(window);
+    BOOL chainPressable = NO; // a suggestion row in an overlay is pressable through the hit-test chain
+    for (id item in chain) if (YMElementHasAction((__bridge AXUIElementRef)item, action)) chainPressable = YES;
+    NSArray *candidates = @[];
+    NSArray *windows = YMWindowsAtPoint(target);
+    for (NSUInteger index = 0; index < windows.count && !(index > 0 && chainPressable); index++) {
+        AXUIElementRef window = (__bridge AXUIElementRef)windows[index];
+        candidates = YMControlsAtPoint(window, target, controls, YES);
+        if (!candidates.count) candidates = YMControlsAtPoint(window, target, controls, NO);
+        if (candidates.count) break;
+    }
     for (NSDictionary *candidate in candidates) {
         AXUIElementRef element = (__bridge AXUIElementRef)candidate[@"element"];
         if (!secondary && YMElementIsText(element)) {
             AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue);
+            YMSelectAllInBrowserField(element);
             self.takeoverTextElement = candidate[@"element"];
             result = @{@"status":@"focused", @"role":candidate[@"role"]};
             break;
@@ -1078,22 +1118,82 @@ static NSString *YMElementValue(AXUIElementRef element) {
     id object = CFBridgingRelease(value);
     return [object isKindOfClass:NSString.class] ? object : @"";
 }
+// In a browser's own fields, edit like a keyboard: typing replaces the
+// selection, delete removes the selection or the character before the caret.
+// The address bar selects its inline autocompletion, so ignoring the selection
+// appended after it and made the autocompleted tail impossible to delete.
+static NSRange YMSelectedRange(AXUIElementRef element, NSUInteger length) {
+    CFTypeRef value = NULL;
+    CFRange range = CFRangeMake(kCFNotFound, 0);
+    if (AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute, &value) == kAXErrorSuccess && value) {
+        AXValueGetValue((AXValueRef)value, kAXValueTypeCFRange, &range);
+        CFRelease(value);
+    }
+    if (range.location == kCFNotFound || range.location < 0 || (NSUInteger)range.location > length) return NSMakeRange(length, 0);
+    return NSMakeRange((NSUInteger)range.location, MIN((NSUInteger)range.length, length - (NSUInteger)range.location));
+}
+static void YMSetSelectedRange(AXUIElementRef element, NSRange range) {
+    CFRange cf = CFRangeMake((CFIndex)range.location, (CFIndex)range.length);
+    AXValueRef value = AXValueCreate(kAXValueTypeCFRange, &cf);
+    AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute, value);
+    CFRelease(value);
+}
+static NSDictionary *YMReplaceRange(AXUIElementRef element, NSRange range, NSString *text) {
+    NSString *value = YMElementValue(element);
+    if (NSMaxRange(range) > value.length) range = NSMakeRange(value.length, 0);
+    NSString *expected = [value stringByReplacingCharactersInRange:range withString:text];
+    NSString *typed = [expected substringToIndex:range.location + text.length]; // what precedes the caret afterwards
+    // Native text fields take the edit as typing (and handle autocompletion);
+    // web inputs ignore it, so fall back to setting the whole value.
+    YMSetSelectedRange(element, range);
+    AXError error = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute, (__bridge CFStringRef)text);
+    NSString *now = YMElementValue(element);
+    BOOL native = error == kAXErrorSuccess && [now hasPrefix:typed] && ![now isEqualToString:value];
+    if (!native) {
+        error = AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)expected);
+        now = YMElementValue(element);
+        // Leave a fresh autocompletion selected; otherwise put the caret after the edit.
+        if ([now isEqualToString:expected]) YMSetSelectedRange(element, NSMakeRange(typed.length, 0));
+    }
+    return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed", @"value":now, @"native":@(native)};
+}
 - (NSDictionary *)typeText:(NSString *)text {
     id target = self.takeoverTextElement;
     if (!target) return @{@"status":@"no-text-focus"};
     AXUIElementRef element = (__bridge AXUIElementRef)target;
-    NSString *next = [YMElementValue(element) stringByAppendingString:text];
-    AXError error = AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)next);
-    return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed", @"value":YMElementValue(element)};
+    if (YMElementInPage(element)) { // web inputs update asynchronously and ignore selected-text edits
+        NSString *next = [YMElementValue(element) stringByAppendingString:text];
+        AXError error = AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)next);
+        return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed", @"value":next};
+    }
+    return YMReplaceRange(element, YMSelectedRange(element, YMElementValue(element).length), text);
 }
-- (void)deleteBackward {
+- (NSDictionary *)deleteBackward {
     id target = self.takeoverTextElement;
-    if (!target) return;
+    if (!target) return @{@"status":@"no-text-focus"};
     AXUIElementRef element = (__bridge AXUIElementRef)target;
     NSString *current = YMElementValue(element);
-    if (!current.length) return;
-    NSRange last = [current rangeOfComposedCharacterSequenceAtIndex:current.length - 1];
-    AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)[current substringToIndex:last.location]);
+    if (YMElementInPage(element)) {
+        if (!current.length) return @{@"status":@"empty", @"value":current};
+        NSString *next = [current substringToIndex:[current rangeOfComposedCharacterSequenceAtIndex:current.length - 1].location];
+        AXError error = AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)next);
+        return @{@"status":error == kAXErrorSuccess ? @"typed" : @"failed", @"value":next};
+    }
+    NSRange range = YMSelectedRange(element, current.length);
+    if (!range.length) {
+        if (!range.location) return @{@"status":@"empty", @"value":current};
+        range = [current rangeOfComposedCharacterSequenceAtIndex:range.location - 1];
+    }
+    NSDictionary *result = YMReplaceRange(element, range, @"");
+    // The address bar puts its suggestion straight back after an edit made
+    // through accessibility, so removing only the suggestion changes nothing.
+    // Then take the character before it too: each Delete still removes one
+    // typed character, and the suggestion stays selected for the next key.
+    if ([result[@"value"] isEqualToString:current] && range.length && range.location) {
+        NSRange previous = [current rangeOfComposedCharacterSequenceAtIndex:range.location - 1];
+        result = YMReplaceRange(element, NSUnionRange(previous, range), @"");
+    }
+    return result;
 }
 - (void)handleTakeoverCommand:(NSString *)command {
     if ([command isEqualToString:@"escape"]) { [self endTakeover]; return; }

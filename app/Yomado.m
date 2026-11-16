@@ -2755,6 +2755,9 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
             dx:0 dy:[info[@"dy"] doubleValue]];
         [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":result}]; return;
     }
+    if ([action isEqualToString:@"delete"]) { // test hook: one Delete key in the focused takeover field
+        [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":[self.workspacePreview deleteBackward]}]; return;
+    }
     if ([action isEqualToString:@"type"]) {
         NSString *text = [info[@"text"] isKindOfClass:NSString.class] ? info[@"text"] : @"";
         [self displayCommandRespond:requestID status:@"ok" extra:@{@"result":[self.workspacePreview typeText:text]}]; return;
@@ -2962,6 +2965,16 @@ static BOOL YMMainWindowIsOnVirtualDisplay(pid_t pid) {
     CGDirectDisplayID displays[4]; uint32_t count = 0;
     CGGetDisplaysWithPoint(CGPointMake(origin.x + size.width / 2, origin.y + size.height / 2), 4, displays, &count);
     if (count == 0 || ![VDVirtualDisplay isVirtualDisplay:displays[0]]) { CFRelease(window); return; }
+    // The person switched to the app, not to that window: an agent (or takeover)
+    // may have focused it. If the app has a window on a physical display, switch
+    // to that one and leave the virtual window where it is.
+    NSDictionary *physical = [self preferPhysicalWindowForPID:front.processIdentifier];
+    if ([physical[@"status"] isEqual:@"ok"]) {
+        AXUIElementRef mine = YMCopyAXWindow(front.processIdentifier, [physical[@"window"] unsignedIntValue]);
+        if (mine) { AXUIElementPerformAction(mine, kAXRaiseAction); CFRelease(mine); }
+        CFRelease(window);
+        return;
+    }
     CGEventRef now = CGEventCreate(NULL);
     CGPoint pointer = now ? CGEventGetLocation(now) : CGPointZero;
     if (now) CFRelease(now);
@@ -3119,7 +3132,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
                 userInfo:@{@"x":@(atof(argv[4])), @"y":@(atof(argv[6]))} options:NSDistributedNotificationDeliverImmediately];
             return 0;
         }
-        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"close-window", @"scroll", @"fence-test", @"prefer-physical"] containsObject:action]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"start", @"close", @"adopt", @"tap", @"type", @"delete", @"close-window", @"scroll", @"fence-test", @"prefer-physical"] containsObject:action]) return YMDisplayCommandUsage();
         NSMutableDictionary *message = [@{@"action":action} mutableCopy];
         for (int index = 3; index < argc; index += 2) {
             if (index + 1 >= argc) return YMDisplayCommandUsage();
@@ -3136,7 +3149,7 @@ static int YMDisplayCommand(int argc, const char *argv[]) {
             else if ([key isEqualToString:@"--dy"]) message[@"dy"] = @(value.doubleValue);
             else return YMDisplayCommandUsage();
         }
-        if (![@[@"list", @"tap", @"type", @"close-window", @"scroll", @"fence-test", @"prefer-physical"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
+        if (![@[@"list", @"tap", @"type", @"delete", @"close-window", @"scroll", @"fence-test", @"prefer-physical"] containsObject:action] && ![message[@"name"] length]) return YMDisplayCommandUsage();
         NSString *requestID = NSUUID.UUID.UUIDString.lowercaseString;
         message[@"requestID"] = requestID;
         __block NSDictionary *reply = nil;
