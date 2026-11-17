@@ -35,6 +35,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 @property(nonatomic, strong) NSMutableArray<YMWPlacement *> *placements;
 @property(nonatomic) BOOL inventoryValid;
 @property(nonatomic, readwrite) BOOL inventoryReady;
+@property(nonatomic, copy, readwrite) NSArray<NSDictionary *> *inventoryBlockers;
 @property(nonatomic) BOOL inventoryReadyPublished;
 @property(nonatomic) BOOL operationInProgress;
 @property(nonatomic, strong) id<YMWorkspaceWindowAccess> windowAccess;
@@ -616,6 +617,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         self.inventoryPublishedAt = 0;
     }
     self.inventoryReady = ready;
+    if (ready) self.inventoryBlockers = @[];
     self.inventoryValid = ready;
     self.inventoryUnmovableWindows = @[];
     self.inventoryConfirmedExcludedKeys = ready ? [excludedKeys copy] : nil;
@@ -721,10 +723,14 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         [self snapshotHasUnresolvedEvidence:movableSnapshot cg:liveCG excludedKeys:classifiedKeys]) {
         // Debug-level trail of what kept the inventory from verifying; view with
         // log show --debug --predicate 'subsystem == "dev.chekusu.yomado" AND category == "inventory"'
+        NSMutableArray *blocked = [NSMutableArray array];
         for (NSDictionary *blocker in snapshot[@"blockers"]) {
             NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:[blocker[@"pid"] intValue]];
             os_log(YMInventoryLog(), "blocker %{public}@ %{public}@ window %{public}@", blocker[@"reason"], app.bundleIdentifier ?: @"?", blocker[@"windowID"]);
+            [blocked addObject:@{@"app":app.bundleIdentifier ?: @"?", @"windowID":blocker[@"windowID"] ?: @0, @"reason":blocker[@"reason"] ?: @""}];
         }
+        if (!blocked.count) [blocked addObject:@{@"app":@"?", @"windowID":@0, @"reason":reason.length ? reason : @"incomplete"}];
+        self.inventoryBlockers = blocked;
         os_log(YMInventoryLog(), "inventory incomplete: reason=%{public}@ complete=%d", reason, complete);
         NSArray *partial = snapshot
             ? [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps]

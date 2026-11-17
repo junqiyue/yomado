@@ -2696,6 +2696,7 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
         CGRect bounds = CGDisplayBounds(ident);
         info[@"displayID"] = @(ident);
         info[@"bounds"] = @{@"x":@(bounds.origin.x), @"y":@(bounds.origin.y), @"width":@(bounds.size.width), @"height":@(bounds.size.height)};
+        info[@"closable"] = @([self.appWorkspace inventoryReadyForClosingDisplayID:ident]);
     }
     return info;
 }
@@ -2766,8 +2767,19 @@ static const NSTimeInterval YMDisplayCommandSeconds = 45;
         NSMutableArray *displays = [NSMutableArray array];
         for (YMManagedDisplay *profile in self.displayProfiles) [displays addObject:[self displayCommandInfoForProfile:profile]];
         [self.appWorkspace refreshInventory];
-        NSDictionary *inventory = @{@"ready":@(self.appWorkspace.inventoryReady),
-            @"accessibilityTrusted":@(self.appWorkspace.accessibilityTrusted), @"status":self.appWorkspace.statusText ?: @""};
+        // "ready" means every window on the whole desktop was matched, which
+        // only closing a display needs. Say what is in the way, so a caller
+        // doesn't read ready=false as "the display can't be used".
+        NSArray *blockers = self.appWorkspace.inventoryBlockers ?: @[];
+        BOOL ready = self.appWorkspace.inventoryReady;
+        NSString *status = self.appWorkspace.statusText ?: @"";
+        if (!ready && blockers.count)
+            status = [NSString stringWithFormat:@"%lu window(s) could not be matched (%@). This only holds back closing a display; running displays are usable.",
+                (unsigned long)blockers.count, [[blockers valueForKey:@"app"] componentsJoinedByString:@", "]];
+        else if (!ready) // not checked yet, e.g. right after a display started
+            status = @"The window inventory is still being checked. This only holds back closing a display; running displays are usable.";
+        NSDictionary *inventory = @{@"ready":@(ready), @"blockers":blockers,
+            @"accessibilityTrusted":@(self.appWorkspace.accessibilityTrusted), @"status":status};
         [self displayCommandRespond:requestID status:@"ok" extra:@{@"displays":displays, @"inventory":inventory}];
         return;
     }
@@ -3202,6 +3214,25 @@ int main(int argc, const char *argv[]) {
             return SelfTest([NSString stringWithUTF8String:argv[2]], argc > 3 && strcmp(argv[3], "hidpi") == 0);
         if (argc > 3 && strcmp(argv[1], "--watchdog-test") == 0)
             return WatchdogTest([NSString stringWithUTF8String:argv[2]], [NSString stringWithUTF8String:argv[3]]);
+        // Anything else on the command line is a mistake or a request for help.
+        // Answer it and leave: starting the whole app here would hang the
+        // caller and run a second copy beside the one that is already up.
+        // (LaunchServices passes -psn_… and -NSKey value pairs; those start with one dash.)
+        if (argc > 1 && strncmp(argv[1], "--", 2) == 0) {
+            BOOL help = strcmp(argv[1], "--help") == 0;
+            FILE *out = help ? stdout : stderr;
+            if (!help) fprintf(out, "Unknown option: %s\n", argv[1]);
+            fprintf(out, "Usage: Yomado                      start the app\n"
+                         "       Yomado --display <action>   list|start|close|mark|adopt (see Yomado --display)\n"
+                         "       Yomado --input <action>     request|status|release (see Yomado --input)\n"
+                         "       Yomado --diagnose [--include-device-identifiers]\n"
+                         "       Yomado --help\n");
+            return help ? 0 : 64;
+        }
+        if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "-help") == 0)) {
+            printf("Usage: Yomado [--display|--input|--diagnose|--help]\n");
+            return 0;
+        }
         [NSApplication sharedApplication];
         // The interactive app needs a regular identity for independent Stage
         // Manager grouping. Keep LSUIElement for the noninteractive modes above;

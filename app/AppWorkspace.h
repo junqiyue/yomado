@@ -23,6 +23,8 @@ FOUNDATION_EXPORT NSString * const YMAppWorkspaceErrorDomain;
 // Complete published observation matching current topology/permission algebra.
 // Pending, failed, or expired inventory is never ready for close/export gates.
 @property(nonatomic, readonly) BOOL inventoryReady;
+// Windows the last inventory could not match: @{app, windowID, reason}. Empty when ready.
+@property(nonatomic, copy, readonly) NSArray<NSDictionary *> *inventoryBlockers;
 @property(nonatomic, readonly) BOOL needsRestoreBeforeRemovingVirtualDisplay;
 - (void)refreshWithVirtualDisplayIDs:(NSArray<NSNumber *> *)displayIDs
                    displaySnapshot:(NSArray<NSDictionary *> *)snapshot;
